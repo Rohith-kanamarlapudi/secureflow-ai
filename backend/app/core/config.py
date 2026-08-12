@@ -1,4 +1,4 @@
-from pydantic_settings import BaseSettings
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
@@ -10,8 +10,17 @@ class Settings(BaseSettings):
         "postgresql://secureflow:secureflow@localhost:5432/secureflow"
     )
 
-    class Config:
-        env_file = ".env"
+    JWT_SECRET: str = "dev-secret-change-in-production"
+    
+    
+    
+
+    REDIS_URL: str = "redis://localhost:6379/0"
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        extra="ignore",
+    )
 
 
 settings = Settings()

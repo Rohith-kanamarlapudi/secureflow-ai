@@ -5,3 +5,9 @@ sqlalchemy
 psycopg2-binary
 alembic
 bcrypt
+argon2-cffi
+PyJWT
+email-validator
+redis
+pytest
+httpx
