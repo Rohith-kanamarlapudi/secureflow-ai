@@ -1,9 +1,11 @@
 import uuid
 
-from sqlalchemy import Column, String, Boolean, ForeignKey, DateTime, func
+from sqlalchemy import Column, String, Boolean, ForeignKey
 from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy.orm import relationship
 
 from app.db.session import Base
+from app.models.rbac import user_roles
 
 
 class Organization(Base):
@@ -17,12 +19,13 @@ class Organization(Base):
 
     name = Column(
         String,
+        unique=True,
         nullable=False,
     )
 
-    created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
+    users = relationship(
+        "User",
+        back_populates="organization",
     )
 
 
@@ -56,9 +59,16 @@ class User(Base):
     is_active = Column(
         Boolean,
         default=True,
+        nullable=False,
     )
 
-    created_at = Column(
-        DateTime(timezone=True),
-        server_default=func.now(),
+    organization = relationship(
+        "Organization",
+        back_populates="users",
+    )
+
+    roles = relationship(
+        "Role",
+        secondary=user_roles,
+        back_populates="users",
     )

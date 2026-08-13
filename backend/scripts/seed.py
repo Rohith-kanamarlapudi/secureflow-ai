@@ -2,7 +2,22 @@ import bcrypt
 
 from app.db.session import SessionLocal
 from app.models.user import Organization, User
-from app.models.rbac import Role, user_roles
+from app.models.rbac import Role, Permission, user_roles
+
+
+PERMS = [
+    "document:create",
+    "document:read",
+    "document:update",
+    "document:delete",
+    "document:share",
+]
+
+ROLE_PERMS = {
+    "admin": PERMS,
+    "editor": PERMS[:3],
+    "viewer": ["document:read"],
+}
 
 
 def seed():
@@ -23,6 +38,23 @@ def seed():
             db.add(organization)
             db.flush()
 
+        # Permissions
+        permissions = {}
+
+        for permission_code in PERMS:
+            permission = (
+                db.query(Permission)
+                .filter_by(code=permission_code)
+                .first()
+            )
+
+            if not permission:
+                permission = Permission(code=permission_code)
+                db.add(permission)
+                db.flush()
+
+            permissions[permission_code] = permission
+
         # Roles
         roles = {}
 
@@ -39,6 +71,16 @@ def seed():
                 db.flush()
 
             roles[role_name] = role
+
+        # Assign permissions to roles
+        for role_name, permission_codes in ROLE_PERMS.items():
+            role = roles[role_name]
+
+            for permission_code in permission_codes:
+                permission = permissions[permission_code]
+
+                if permission not in role.permissions:
+                    role.permissions.append(permission)
 
         # Admin user
         admin_email = "admin@secureflow.local"
@@ -88,6 +130,7 @@ def seed():
         print("Seed completed successfully")
         print(f"Organization: {organization.name}")
         print("Roles: admin, editor, viewer")
+        print("Permissions: document:create, document:read, document:update, document:delete, document:share")
         print(f"Admin user: {admin_email}")
         print("Admin password: Admin@12345")
 

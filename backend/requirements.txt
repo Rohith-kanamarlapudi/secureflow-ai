@@ -11,3 +11,4 @@ email-validator
 redis
 pytest
 httpx
+python-multipart
