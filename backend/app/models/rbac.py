@@ -7,7 +7,7 @@ from sqlalchemy.orm import relationship
 from app.db.session import Base
 
 
-# User ↔ Role
+# User <-> Role
 user_roles = Table(
     "user_roles",
     Base.metadata,
@@ -26,7 +26,7 @@ user_roles = Table(
 )
 
 
-# Role ↔ Permission
+# Role <-> Permission
 role_permissions = Table(
     "role_permissions",
     Base.metadata,
@@ -60,6 +60,14 @@ class Role(Base):
         nullable=False,
     )
 
+    # User <-> Role relationship
+    users = relationship(
+        "User",
+        secondary=user_roles,
+        back_populates="roles",
+    )
+
+    # Role <-> Permission relationship
     permissions = relationship(
         "Permission",
         secondary=role_permissions,
