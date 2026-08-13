@@ -1,4 +1,12 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+)
+from fastapi.security import (
+    HTTPAuthorizationCredentials,
+    HTTPBearer,
+)
 from sqlalchemy.orm import Session
 from pydantic import BaseModel, EmailStr
 import jwt
@@ -7,14 +15,23 @@ from app.core.config import settings
 from app.core.redis import redis_client
 from app.db.session import get_db
 from app.models.user import User
-from app.core.security import hash_password, verify_password
+from app.core.security import (
+    hash_password,
+    verify_password,
+)
 from app.core.tokens import (
     create_access_token,
     create_refresh_token,
 )
 
 
-router = APIRouter(prefix="/auth", tags=["auth"])
+router = APIRouter(
+    prefix="/auth",
+    tags=["auth"],
+)
+
+
+security = HTTPBearer()
 
 
 class RegisterIn(BaseModel):
@@ -29,9 +46,11 @@ class LoginIn(BaseModel):
 
 
 def get_current_user(
-    token: str,
+    credentials: HTTPAuthorizationCredentials = Depends(security),
     db: Session = Depends(get_db),
 ):
+    token = credentials.credentials
+
     try:
         payload = jwt.decode(
             token,
@@ -59,7 +78,11 @@ def get_current_user(
             detail="Invalid or expired token",
         )
 
-    user = db.query(User).filter_by(id=user_id).first()
+    user = (
+        db.query(User)
+        .filter_by(id=user_id)
+        .first()
+    )
 
     if not user:
         raise HTTPException(
@@ -75,7 +98,13 @@ def register(
     payload: RegisterIn,
     db: Session = Depends(get_db),
 ):
-    if db.query(User).filter_by(email=payload.email).first():
+    existing_user = (
+        db.query(User)
+        .filter_by(email=payload.email)
+        .first()
+    )
+
+    if existing_user:
         raise HTTPException(
             status_code=409,
             detail="Email already registered",
@@ -92,7 +121,7 @@ def register(
     db.refresh(user)
 
     return {
-        "id": str(user.id)
+        "id": str(user.id),
     }
 
 
@@ -117,17 +146,25 @@ def login(
         )
 
     return {
-        "access_token": create_access_token(str(user.id)),
-        "refresh_token": create_refresh_token(str(user.id)),
+        "access_token": create_access_token(
+            str(user.id)
+        ),
+        "refresh_token": create_refresh_token(
+            str(user.id)
+        ),
     }
 
 
 @router.post("/logout")
-def logout(token_id: str):
-    redis_client.delete(f"refresh:{token_id}")
+def logout(
+    token_id: str,
+):
+    redis_client.delete(
+        f"refresh:{token_id}"
+    )
 
     return {
-        "status": "revoked"
+        "status": "revoked",
     }
 
 
