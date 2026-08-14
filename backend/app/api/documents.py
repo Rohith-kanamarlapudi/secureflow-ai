@@ -1,6 +1,8 @@
 from uuid import UUID
 
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
@@ -14,6 +16,42 @@ router = APIRouter(
     prefix="/documents",
     tags=["documents"],
 )
+
+
+# ============================================================
+# Request schemas
+# ============================================================
+
+class DocumentUpdateIn(BaseModel):
+    filename: str | None = None
+
+
+# ============================================================
+# Helper
+# ============================================================
+
+def _get_owned_or_404(
+    db: Session,
+    doc_id: UUID,
+    current_user: User,
+) -> Document:
+
+    doc = (
+        db.query(Document)
+        .filter(
+            Document.id == doc_id,
+            Document.organization_id == current_user.organization_id,
+        )
+        .first()
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    return doc
 
 
 # ============================================================
@@ -87,20 +125,11 @@ def get_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    doc = (
-        db.query(Document)
-        .filter(
-            Document.id == doc_id,
-            Document.organization_id == current_user.organization_id,
-        )
-        .first()
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
     )
-
-    if not doc:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found",
-        )
 
     return {
         "id": str(doc.id),
@@ -114,39 +143,93 @@ def get_document(
 
 
 # ============================================================
-# Delete document
+# Download document
+# ============================================================
+
+@router.get(
+    "/{doc_id}/download",
+    dependencies=[
+        Depends(require_permission("document:read"))
+    ],
+)
+def download_document(
+    doc_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    return FileResponse(
+        f"./storage/{doc.filename}",
+        filename=doc.filename,
+        media_type=doc.mime_type,
+    )
+
+
+# ============================================================
+# Rename document
+# ============================================================
+
+@router.patch(
+    "/{doc_id}",
+    dependencies=[
+        Depends(require_permission("document:update"))
+    ],
+)
+def update_document(
+    doc_id: UUID,
+    payload: DocumentUpdateIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    if payload.filename:
+        doc.filename = payload.filename
+
+    db.commit()
+    db.refresh(doc)
+
+    return {
+        "id": str(doc.id),
+        "filename": doc.filename,
+    }
+
+
+# ============================================================
+# Archive document
 # ============================================================
 
 @router.delete(
-    "/{document_id}",
+    "/{doc_id}",
     dependencies=[
         Depends(require_permission("document:delete"))
     ],
 )
-def delete_document(
-    document_id: UUID,
+def archive_document(
+    doc_id: UUID,
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    document = (
-        db.query(Document)
-        .filter(
-            Document.id == document_id,
-            Document.organization_id == current_user.organization_id,
-        )
-        .first()
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
     )
 
-    if not document:
-        raise HTTPException(
-            status_code=404,
-            detail="Document not found",
-        )
+    doc.is_archived = True
 
-    db.delete(document)
     db.commit()
 
     return {
-        "status": "deleted",
-        "id": str(document_id),
+        "status": "archived",
+        "id": str(doc.id),
     }
