@@ -11,9 +11,6 @@ class Settings(BaseSettings):
     )
 
     JWT_SECRET: str = "dev-secret-change-in-production"
-    
-    
-    
 
     REDIS_URL: str = "redis://localhost:6379/0"
 

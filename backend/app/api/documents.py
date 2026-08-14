@@ -19,6 +19,21 @@ router = APIRouter(
 
 
 # ============================================================
+# Upload configuration
+# ============================================================
+
+ALLOWED_MIME_TYPES = {
+    "text/plain",
+    "application/pdf",
+    "image/png",
+    "image/jpeg",
+    "application/json",
+}
+
+MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
+
+
+# ============================================================
 # Request schemas
 # ============================================================
 
@@ -69,6 +84,36 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # Validate filename
+    if not file.filename:
+        raise HTTPException(
+            status_code=400,
+            detail="Filename is required.",
+        )
+
+    # Validate MIME type
+    if file.content_type not in ALLOWED_MIME_TYPES:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Unsupported file type. "
+                "Allowed types: PDF, TXT, PNG, JPEG and JSON."
+            ),
+        )
+
+    # Read file to validate size
+    contents = await file.read()
+
+    if len(contents) > MAX_FILE_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail="File too large. Maximum file size is 10 MB.",
+        )
+
+    # Reset file pointer
+    await file.seek(0)
+
+    # Create database record
     doc = Document(
         filename=file.filename,
         mime_type=file.content_type,
@@ -83,6 +128,10 @@ async def upload_document(
     return {
         "id": str(doc.id),
         "filename": doc.filename,
+        "mime_type": doc.mime_type,
+        "owner_id": str(doc.owner_id),
+        "organization_id": str(doc.organization_id),
+        "created_at": doc.created_at,
     }
 
 
@@ -105,36 +154,52 @@ def list_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    # --------------------------------------------------------
     # Validate page
+    # --------------------------------------------------------
+
     if page < 1:
         raise HTTPException(
             status_code=400,
             detail="page must be greater than or equal to 1",
         )
 
+    # --------------------------------------------------------
     # Validate size
+    # --------------------------------------------------------
+
     if size < 1 or size > 100:
         raise HTTPException(
             status_code=400,
             detail="size must be between 1 and 100",
         )
 
+    # --------------------------------------------------------
     # Base query
+    # --------------------------------------------------------
+
     query = (
         db.query(Document)
         .filter(
-            Document.organization_id == current_user.organization_id,
+            Document.organization_id
+            == current_user.organization_id,
             Document.is_archived.is_(False),
         )
     )
 
+    # --------------------------------------------------------
     # Filename filtering
+    # --------------------------------------------------------
+
     if filename:
         query = query.filter(
             Document.filename.ilike(f"%{filename}%")
         )
 
+    # --------------------------------------------------------
     # Sorting
+    # --------------------------------------------------------
+
     if sort == "-created_at":
         query = query.order_by(
             Document.created_at.desc()
@@ -151,7 +216,10 @@ def list_documents(
             detail="sort must be 'created_at' or '-created_at'",
         )
 
+    # --------------------------------------------------------
     # Pagination
+    # --------------------------------------------------------
+
     documents = (
         query
         .offset((page - 1) * size)
@@ -244,8 +312,18 @@ def update_document(
         current_user,
     )
 
-    if payload.filename:
-        doc.filename = payload.filename
+    # Validate filename
+    if payload.filename is not None:
+
+        new_filename = payload.filename.strip()
+
+        if not new_filename:
+            raise HTTPException(
+                status_code=400,
+                detail="Filename cannot be empty.",
+            )
+
+        doc.filename = new_filename
 
     db.commit()
     db.refresh(doc)
@@ -253,6 +331,8 @@ def update_document(
     return {
         "id": str(doc.id),
         "filename": doc.filename,
+        "mime_type": doc.mime_type,
+        "created_at": doc.created_at,
     }
 
 
@@ -277,9 +357,11 @@ def archive_document(
         current_user,
     )
 
+    # Soft delete / archive
     doc.is_archived = True
 
     db.commit()
+    db.refresh(doc)
 
     return {
         "status": "archived",
