@@ -88,6 +88,7 @@ async def upload_document(
 
 # ============================================================
 # List documents
+# Pagination + filtering + sorting
 # ============================================================
 
 @router.get(
@@ -97,17 +98,68 @@ async def upload_document(
     ],
 )
 def list_documents(
+    page: int = 1,
+    size: int = 20,
+    filename: str | None = None,
+    sort: str = "-created_at",
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    return (
+    # Validate page
+    if page < 1:
+        raise HTTPException(
+            status_code=400,
+            detail="page must be greater than or equal to 1",
+        )
+
+    # Validate size
+    if size < 1 or size > 100:
+        raise HTTPException(
+            status_code=400,
+            detail="size must be between 1 and 100",
+        )
+
+    # Base query
+    query = (
         db.query(Document)
         .filter(
             Document.organization_id == current_user.organization_id,
             Document.is_archived.is_(False),
         )
+    )
+
+    # Filename filtering
+    if filename:
+        query = query.filter(
+            Document.filename.ilike(f"%{filename}%")
+        )
+
+    # Sorting
+    if sort == "-created_at":
+        query = query.order_by(
+            Document.created_at.desc()
+        )
+
+    elif sort == "created_at":
+        query = query.order_by(
+            Document.created_at.asc()
+        )
+
+    else:
+        raise HTTPException(
+            status_code=400,
+            detail="sort must be 'created_at' or '-created_at'",
+        )
+
+    # Pagination
+    documents = (
+        query
+        .offset((page - 1) * size)
+        .limit(size)
         .all()
     )
+
+    return documents
 
 
 # ============================================================
