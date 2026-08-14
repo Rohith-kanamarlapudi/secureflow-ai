@@ -1,8 +1,7 @@
-import bcrypt
-
 from app.db.session import SessionLocal
 from app.models.user import Organization, User
 from app.models.rbac import Role, Permission, user_roles
+from app.core.security import hash_password
 
 
 PERMS = [
@@ -12,6 +11,7 @@ PERMS = [
     "document:delete",
     "document:share",
 ]
+
 
 ROLE_PERMS = {
     "admin": PERMS,
@@ -24,7 +24,10 @@ def seed():
     db = SessionLocal()
 
     try:
+        # ============================================================
         # Organization
+        # ============================================================
+
         organization = (
             db.query(Organization)
             .filter_by(name="SecureFlow Demo Organization")
@@ -35,10 +38,14 @@ def seed():
             organization = Organization(
                 name="SecureFlow Demo Organization"
             )
+
             db.add(organization)
             db.flush()
 
+        # ============================================================
         # Permissions
+        # ============================================================
+
         permissions = {}
 
         for permission_code in PERMS:
@@ -49,13 +56,19 @@ def seed():
             )
 
             if not permission:
-                permission = Permission(code=permission_code)
+                permission = Permission(
+                    code=permission_code
+                )
+
                 db.add(permission)
                 db.flush()
 
             permissions[permission_code] = permission
 
+        # ============================================================
         # Roles
+        # ============================================================
+
         roles = {}
 
         for role_name in ["admin", "editor", "viewer"]:
@@ -66,13 +79,19 @@ def seed():
             )
 
             if not role:
-                role = Role(name=role_name)
+                role = Role(
+                    name=role_name
+                )
+
                 db.add(role)
                 db.flush()
 
             roles[role_name] = role
 
+        # ============================================================
         # Assign permissions to roles
+        # ============================================================
+
         for role_name, permission_codes in ROLE_PERMS.items():
             role = roles[role_name]
 
@@ -82,8 +101,12 @@ def seed():
                 if permission not in role.permissions:
                     role.permissions.append(permission)
 
+        # ============================================================
         # Admin user
-        admin_email = "admin@secureflow.local"
+        # ============================================================
+
+        admin_email = "admin@secureflow.example.com"
+        admin_password = "Admin@12345"
 
         admin = (
             db.query(User)
@@ -92,24 +115,20 @@ def seed():
         )
 
         if not admin:
-            password = "Admin@12345"
-
-            hashed_password = bcrypt.hashpw(
-                password.encode("utf-8"),
-                bcrypt.gensalt(),
-            ).decode("utf-8")
-
             admin = User(
                 organization_id=organization.id,
                 email=admin_email,
-                hashed_password=hashed_password,
+                hashed_password=hash_password(admin_password),
                 is_active=True,
             )
 
             db.add(admin)
             db.flush()
 
+        # ============================================================
         # Assign admin role
+        # ============================================================
+
         existing_assignment = db.execute(
             user_roles.select().where(
                 user_roles.c.user_id == admin.id,
@@ -125,14 +144,25 @@ def seed():
                 )
             )
 
+        # ============================================================
+        # Commit
+        # ============================================================
+
         db.commit()
 
         print("Seed completed successfully")
         print(f"Organization: {organization.name}")
         print("Roles: admin, editor, viewer")
-        print("Permissions: document:create, document:read, document:update, document:delete, document:share")
+        print(
+            "Permissions: "
+            "document:create, "
+            "document:read, "
+            "document:update, "
+            "document:delete, "
+            "document:share"
+        )
         print(f"Admin user: {admin_email}")
-        print("Admin password: Admin@12345")
+        print(f"Admin password: {admin_password}")
 
     except Exception:
         db.rollback()
