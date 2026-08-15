@@ -1,15 +1,23 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
-from fastapi.responses import FileResponse
+from fastapi import (
+    APIRouter,
+    Depends,
+    HTTPException,
+    UploadFile,
+    File,
+)
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
 from app.api.deps import require_permission
 from app.db.session import get_db
-from app.models.document import Document
+
+from app.models.document import Document, DocumentVersion
 from app.models.user import User
+
+from app.storage.local import LocalStorage
 
 
 router = APIRouter(
@@ -19,18 +27,26 @@ router = APIRouter(
 
 
 # ============================================================
-# Upload configuration
+# Storage
 # ============================================================
 
-ALLOWED_MIME_TYPES = {
-    "text/plain",
+storage = LocalStorage("./storage")
+
+
+# ============================================================
+# Upload validation
+# ============================================================
+
+MAX_SIZE = 50 * 1024 * 1024  # 50 MB
+
+ALLOWED_MIME = {
     "application/pdf",
     "image/png",
     "image/jpeg",
-    "application/json",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    "application/msword",
 }
-
-MAX_FILE_SIZE = 10 * 1024 * 1024  # 10 MB
 
 
 # ============================================================
@@ -55,7 +71,8 @@ def _get_owned_or_404(
         db.query(Document)
         .filter(
             Document.id == doc_id,
-            Document.organization_id == current_user.organization_id,
+            Document.organization_id
+            == current_user.organization_id,
         )
         .first()
     )
@@ -76,7 +93,9 @@ def _get_owned_or_404(
 @router.post(
     "",
     dependencies=[
-        Depends(require_permission("document:create"))
+        Depends(
+            require_permission("document:create")
+        )
     ],
 )
 async def upload_document(
@@ -84,66 +103,137 @@ async def upload_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    # Validate filename
-    if not file.filename:
-        raise HTTPException(
-            status_code=400,
-            detail="Filename is required.",
-        )
 
+    # --------------------------------------------------------
     # Validate MIME type
-    if file.content_type not in ALLOWED_MIME_TYPES:
+    # --------------------------------------------------------
+
+    if file.content_type not in ALLOWED_MIME:
         raise HTTPException(
-            status_code=400,
-            detail=(
-                "Unsupported file type. "
-                "Allowed types: PDF, TXT, PNG, JPEG and JSON."
-            ),
+            status_code=415,
+            detail=f"Unsupported file type: {file.content_type}",
         )
 
-    # Read file to validate size
-    contents = await file.read()
+    # --------------------------------------------------------
+    # Read file
+    # --------------------------------------------------------
 
-    if len(contents) > MAX_FILE_SIZE:
+    data = await file.read()
+
+    # --------------------------------------------------------
+    # Validate file size
+    # --------------------------------------------------------
+
+    if len(data) > MAX_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="File too large. Maximum file size is 10 MB.",
+            detail="File too large. Maximum size is 50 MB.",
         )
 
-    # Reset file pointer
-    await file.seek(0)
+    if len(data) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty.",
+        )
 
-    # Create database record
+    # --------------------------------------------------------
+    # Create document metadata
+    # --------------------------------------------------------
+
     doc = Document(
-        filename=file.filename,
+        filename=file.filename or "unnamed",
         mime_type=file.content_type,
         owner_id=current_user.id,
         organization_id=current_user.organization_id,
     )
 
     db.add(doc)
-    db.commit()
-    db.refresh(doc)
+    db.flush()
+
+    # --------------------------------------------------------
+    # Generate storage key
+    # --------------------------------------------------------
+
+    storage_key = (
+        f"{current_user.organization_id}/"
+        f"{doc.id}/"
+        f"v1"
+    )
+
+    # --------------------------------------------------------
+    # Store file object
+    # --------------------------------------------------------
+
+    try:
+
+        storage.put(
+            storage_key,
+            data,
+            file.content_type,
+        )
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to store document: {str(exc)}",
+        )
+
+    # --------------------------------------------------------
+    # Create document version
+    # --------------------------------------------------------
+
+    version = DocumentVersion(
+        document_id=doc.id,
+        version_number=1,
+        storage_key=storage_key,
+    )
+
+    db.add(version)
+
+    # --------------------------------------------------------
+    # Commit metadata
+    # --------------------------------------------------------
+
+    try:
+
+        db.commit()
+        db.refresh(doc)
+
+    except Exception:
+
+        db.rollback()
+
+        # Best-effort cleanup of orphaned object
+        try:
+            storage.delete(storage_key)
+        except Exception:
+            pass
+
+        raise
 
     return {
         "id": str(doc.id),
         "filename": doc.filename,
         "mime_type": doc.mime_type,
-        "owner_id": str(doc.owner_id),
-        "organization_id": str(doc.organization_id),
-        "created_at": doc.created_at,
+        "size": len(data),
+        "storage_key": storage_key,
+        "version": 1,
     }
 
 
 # ============================================================
 # List documents
-# Pagination + filtering + sorting
 # ============================================================
 
 @router.get(
     "",
     dependencies=[
-        Depends(require_permission("document:read"))
+        Depends(
+            require_permission("document:read")
+        )
     ],
 )
 def list_documents(
@@ -154,6 +244,7 @@ def list_documents(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     # --------------------------------------------------------
     # Validate page
     # --------------------------------------------------------
@@ -193,7 +284,9 @@ def list_documents(
 
     if filename:
         query = query.filter(
-            Document.filename.ilike(f"%{filename}%")
+            Document.filename.ilike(
+                f"%{filename}%"
+            )
         )
 
     # --------------------------------------------------------
@@ -201,19 +294,25 @@ def list_documents(
     # --------------------------------------------------------
 
     if sort == "-created_at":
+
         query = query.order_by(
             Document.created_at.desc()
         )
 
     elif sort == "created_at":
+
         query = query.order_by(
             Document.created_at.asc()
         )
 
     else:
+
         raise HTTPException(
             status_code=400,
-            detail="sort must be 'created_at' or '-created_at'",
+            detail=(
+                "sort must be "
+                "'created_at' or '-created_at'"
+            ),
         )
 
     # --------------------------------------------------------
@@ -237,7 +336,9 @@ def list_documents(
 @router.get(
     "/{doc_id}",
     dependencies=[
-        Depends(require_permission("document:read"))
+        Depends(
+            require_permission("document:read")
+        )
     ],
 )
 def get_document(
@@ -245,6 +346,7 @@ def get_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     doc = _get_owned_or_404(
         db,
         doc_id,
@@ -256,7 +358,9 @@ def get_document(
         "filename": doc.filename,
         "mime_type": doc.mime_type,
         "owner_id": str(doc.owner_id),
-        "organization_id": str(doc.organization_id),
+        "organization_id": str(
+            doc.organization_id
+        ),
         "is_archived": doc.is_archived,
         "created_at": doc.created_at,
     }
@@ -269,7 +373,9 @@ def get_document(
 @router.get(
     "/{doc_id}/download",
     dependencies=[
-        Depends(require_permission("document:read"))
+        Depends(
+            require_permission("document:read")
+        )
     ],
 )
 def download_document(
@@ -277,16 +383,66 @@ def download_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     doc = _get_owned_or_404(
         db,
         doc_id,
         current_user,
     )
 
-    return FileResponse(
-        f"./storage/{doc.filename}",
-        filename=doc.filename,
+    # --------------------------------------------------------
+    # Get latest version
+    # --------------------------------------------------------
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.document_id
+            == doc.id
+        )
+        .order_by(
+            DocumentVersion.version_number.desc()
+        )
+        .first()
+    )
+
+    if not version:
+        raise HTTPException(
+            status_code=404,
+            detail="Document version not found",
+        )
+
+    # --------------------------------------------------------
+    # Read object from storage
+    # --------------------------------------------------------
+
+    try:
+
+        data = storage.get(
+            version.storage_key
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Document file not found in storage",
+        )
+
+    # --------------------------------------------------------
+    # Return file
+    # --------------------------------------------------------
+
+    from fastapi.responses import Response
+
+    return Response(
+        content=data,
         media_type=doc.mime_type,
+        headers={
+            "Content-Disposition": (
+                f'attachment; filename="{doc.filename}"'
+            )
+        },
     )
 
 
@@ -297,7 +453,9 @@ def download_document(
 @router.patch(
     "/{doc_id}",
     dependencies=[
-        Depends(require_permission("document:update"))
+        Depends(
+            require_permission("document:update")
+        )
     ],
 )
 def update_document(
@@ -306,24 +464,15 @@ def update_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     doc = _get_owned_or_404(
         db,
         doc_id,
         current_user,
     )
 
-    # Validate filename
-    if payload.filename is not None:
-
-        new_filename = payload.filename.strip()
-
-        if not new_filename:
-            raise HTTPException(
-                status_code=400,
-                detail="Filename cannot be empty.",
-            )
-
-        doc.filename = new_filename
+    if payload.filename:
+        doc.filename = payload.filename
 
     db.commit()
     db.refresh(doc)
@@ -331,8 +480,6 @@ def update_document(
     return {
         "id": str(doc.id),
         "filename": doc.filename,
-        "mime_type": doc.mime_type,
-        "created_at": doc.created_at,
     }
 
 
@@ -343,7 +490,9 @@ def update_document(
 @router.delete(
     "/{doc_id}",
     dependencies=[
-        Depends(require_permission("document:delete"))
+        Depends(
+            require_permission("document:delete")
+        )
     ],
 )
 def archive_document(
@@ -351,17 +500,16 @@ def archive_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     doc = _get_owned_or_404(
         db,
         doc_id,
         current_user,
     )
 
-    # Soft delete / archive
     doc.is_archived = True
 
     db.commit()
-    db.refresh(doc)
 
     return {
         "status": "archived",
