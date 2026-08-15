@@ -15,10 +15,12 @@ from app.core.config import settings
 from app.core.redis import redis_client
 from app.db.session import get_db
 from app.models.user import User
+
 from app.core.security import (
     hash_password,
     verify_password,
 )
+
 from app.core.tokens import (
     create_access_token,
     create_refresh_token,
@@ -31,8 +33,18 @@ router = APIRouter(
 )
 
 
-security = HTTPBearer()
+# ============================================================
+# JWT Bearer Authentication
+# ============================================================
 
+security = HTTPBearer(
+    scheme_name="BearerAuth"
+)
+
+
+# ============================================================
+# Request Schemas
+# ============================================================
 
 class RegisterIn(BaseModel):
     email: EmailStr
@@ -45,8 +57,14 @@ class LoginIn(BaseModel):
     password: str
 
 
+# ============================================================
+# Current User
+# ============================================================
+
 def get_current_user(
-    credentials: HTTPAuthorizationCredentials = Depends(security),
+    credentials: HTTPAuthorizationCredentials = Depends(
+        security
+    ),
     db: Session = Depends(get_db),
 ):
     token = credentials.credentials
@@ -93,6 +111,10 @@ def get_current_user(
     return user
 
 
+# ============================================================
+# Register
+# ============================================================
+
 @router.post("/register")
 def register(
     payload: RegisterIn,
@@ -112,7 +134,9 @@ def register(
 
     user = User(
         email=payload.email,
-        hashed_password=hash_password(payload.password),
+        hashed_password=hash_password(
+            payload.password
+        ),
         organization_id=payload.organization_id,
     )
 
@@ -124,6 +148,10 @@ def register(
         "id": str(user.id),
     }
 
+
+# ============================================================
+# Login
+# ============================================================
 
 @router.post("/login")
 def login(
@@ -155,6 +183,10 @@ def login(
     }
 
 
+# ============================================================
+# Logout
+# ============================================================
+
 @router.post("/logout")
 def logout(
     token_id: str,
@@ -168,9 +200,15 @@ def logout(
     }
 
 
+# ============================================================
+# Current User
+# ============================================================
+
 @router.get("/me")
 def me(
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(
+        get_current_user
+    ),
 ):
     return {
         "id": str(current_user.id),
