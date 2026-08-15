@@ -1,4 +1,5 @@
 from uuid import UUID
+import io
 
 from fastapi import (
     APIRouter,
@@ -7,16 +8,15 @@ from fastapi import (
     UploadFile,
     File,
 )
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
 from app.api.deps import require_permission
 from app.db.session import get_db
-
 from app.models.document import Document, DocumentVersion
 from app.models.user import User
-
 from app.storage.local import LocalStorage
 
 
@@ -165,7 +165,6 @@ async def upload_document(
     # --------------------------------------------------------
 
     try:
-
         storage.put(
             storage_key,
             data,
@@ -173,7 +172,6 @@ async def upload_document(
         )
 
     except Exception as exc:
-
         db.rollback()
 
         raise HTTPException(
@@ -198,12 +196,10 @@ async def upload_document(
     # --------------------------------------------------------
 
     try:
-
         db.commit()
         db.refresh(doc)
 
     except Exception:
-
         db.rollback()
 
         # Best-effort cleanup of orphaned object
@@ -397,8 +393,7 @@ def download_document(
     version = (
         db.query(DocumentVersion)
         .filter(
-            DocumentVersion.document_id
-            == doc.id
+            DocumentVersion.document_id == doc.id
         )
         .order_by(
             DocumentVersion.version_number.desc()
@@ -417,27 +412,26 @@ def download_document(
     # --------------------------------------------------------
 
     try:
-
         data = storage.get(
             version.storage_key
         )
 
     except Exception:
-
         raise HTTPException(
             status_code=404,
             detail="Document file not found in storage",
         )
 
     # --------------------------------------------------------
-    # Return file
+    # Stream file to client
     # --------------------------------------------------------
 
-    from fastapi.responses import Response
-
-    return Response(
-        content=data,
-        media_type=doc.mime_type,
+    return StreamingResponse(
+        io.BytesIO(data),
+        media_type=(
+            doc.mime_type
+            or "application/octet-stream"
+        ),
         headers={
             "Content-Disposition": (
                 f'attachment; filename="{doc.filename}"'
