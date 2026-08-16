@@ -14,6 +14,10 @@ class Settings(BaseSettings):
 
     REDIS_URL: str = "redis://localhost:6379/0"
 
+    ENCRYPTION_MASTER_KEY: str = (
+        "secureflow-ai-master-key-2026"
+    )
+
     model_config = SettingsConfigDict(
         env_file=".env",
         extra="ignore",

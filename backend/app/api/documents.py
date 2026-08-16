@@ -15,9 +15,21 @@ from sqlalchemy.orm import Session
 from app.api.auth import get_current_user
 from app.api.deps import require_permission
 from app.db.session import get_db
-from app.models.document import Document, DocumentVersion
+
+# EncryptionKey is in document.py in your project
+from app.models.document import (
+    Document,
+    DocumentVersion,
+    EncryptionKey,
+)
 from app.models.user import User
+
 from app.storage.local import LocalStorage
+
+from app.crypto.base import EncryptedBlob
+from app.crypto.aes_service import encrypt_file
+from app.crypto.decrypt_service import decrypt_file
+from app.crypto.master_key import get_master_key
 
 
 router = APIRouter(
@@ -71,8 +83,7 @@ def _get_owned_or_404(
         db.query(Document)
         .filter(
             Document.id == doc_id,
-            Document.organization_id
-            == current_user.organization_id,
+            Document.organization_id == current_user.organization_id,
         )
         .first()
     )
@@ -161,14 +172,28 @@ async def upload_document(
     )
 
     # --------------------------------------------------------
-    # Store file object
+    # Encrypt file
+    # --------------------------------------------------------
+
+    blob = encrypt_file(
+        plaintext=data,
+        master_key=get_master_key(),
+        key_version="v1",
+    )
+
+    # AES-GCM returns ciphertext + authentication tag.
+    # Store both in object storage.
+    encrypted_data = blob.ciphertext + blob.tag
+
+    # --------------------------------------------------------
+    # Store encrypted object
     # --------------------------------------------------------
 
     try:
         storage.put(
             storage_key,
-            data,
-            file.content_type,
+            encrypted_data,
+            file.content_type or "application/octet-stream",
         )
 
     except Exception as exc:
@@ -176,20 +201,42 @@ async def upload_document(
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to store document: {str(exc)}",
+            detail=f"Failed to store encrypted document: {str(exc)}",
         )
 
     # --------------------------------------------------------
     # Create document version
+    #
+    # nonce belongs to DocumentVersion
     # --------------------------------------------------------
 
     version = DocumentVersion(
         document_id=doc.id,
         version_number=1,
         storage_key=storage_key,
+        nonce=blob.nonce,
     )
 
     db.add(version)
+    db.flush()
+
+    # --------------------------------------------------------
+    # Store encryption metadata
+    #
+    # EncryptionKey stores:
+    # - wrapped_key
+    # - key_version
+    #
+    # nonce is stored on DocumentVersion.
+    # --------------------------------------------------------
+
+    encryption_key = EncryptionKey(
+        document_version_id=version.id,
+        wrapped_key=blob.wrapped_key,
+        key_version=blob.key_version,
+    )
+
+    db.add(encryption_key)
 
     # --------------------------------------------------------
     # Commit metadata
@@ -202,13 +249,17 @@ async def upload_document(
     except Exception:
         db.rollback()
 
-        # Best-effort cleanup of orphaned object
+        # Remove encrypted object if database commit fails
         try:
             storage.delete(storage_key)
         except Exception:
             pass
 
         raise
+
+    # --------------------------------------------------------
+    # Response
+    # --------------------------------------------------------
 
     return {
         "id": str(doc.id),
@@ -217,6 +268,8 @@ async def upload_document(
         "size": len(data),
         "storage_key": storage_key,
         "version": 1,
+        "encrypted": True,
+        "key_version": blob.key_version,
     }
 
 
@@ -241,29 +294,17 @@ def list_documents(
     current_user: User = Depends(get_current_user),
 ):
 
-    # --------------------------------------------------------
-    # Validate page
-    # --------------------------------------------------------
-
     if page < 1:
         raise HTTPException(
             status_code=400,
             detail="page must be greater than or equal to 1",
         )
 
-    # --------------------------------------------------------
-    # Validate size
-    # --------------------------------------------------------
-
     if size < 1 or size > 100:
         raise HTTPException(
             status_code=400,
             detail="size must be between 1 and 100",
         )
-
-    # --------------------------------------------------------
-    # Base query
-    # --------------------------------------------------------
 
     query = (
         db.query(Document)
@@ -274,10 +315,6 @@ def list_documents(
         )
     )
 
-    # --------------------------------------------------------
-    # Filename filtering
-    # --------------------------------------------------------
-
     if filename:
         query = query.filter(
             Document.filename.ilike(
@@ -285,24 +322,17 @@ def list_documents(
             )
         )
 
-    # --------------------------------------------------------
-    # Sorting
-    # --------------------------------------------------------
-
     if sort == "-created_at":
-
         query = query.order_by(
             Document.created_at.desc()
         )
 
     elif sort == "created_at":
-
         query = query.order_by(
             Document.created_at.asc()
         )
 
     else:
-
         raise HTTPException(
             status_code=400,
             detail=(
@@ -310,10 +340,6 @@ def list_documents(
                 "'created_at' or '-created_at'"
             ),
         )
-
-    # --------------------------------------------------------
-    # Pagination
-    # --------------------------------------------------------
 
     documents = (
         query
@@ -380,6 +406,10 @@ def download_document(
     current_user: User = Depends(get_current_user),
 ):
 
+    # --------------------------------------------------------
+    # Find document
+    # --------------------------------------------------------
+
     doc = _get_owned_or_404(
         db,
         doc_id,
@@ -408,11 +438,30 @@ def download_document(
         )
 
     # --------------------------------------------------------
-    # Read object from storage
+    # Get encryption metadata
+    # --------------------------------------------------------
+
+    encryption_key = (
+        db.query(EncryptionKey)
+        .filter(
+            EncryptionKey.document_version_id
+            == version.id
+        )
+        .first()
+    )
+
+    if not encryption_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Encryption metadata not found",
+        )
+
+    # --------------------------------------------------------
+    # Read encrypted object
     # --------------------------------------------------------
 
     try:
-        data = storage.get(
+        encrypted_data = storage.get(
             version.storage_key
         )
 
@@ -423,11 +472,61 @@ def download_document(
         )
 
     # --------------------------------------------------------
-    # Stream file to client
+    # Validate encrypted data
+    #
+    # AES-GCM authentication tag is 16 bytes.
+    # --------------------------------------------------------
+
+    if len(encrypted_data) < 16:
+        raise HTTPException(
+            status_code=500,
+            detail="Stored encrypted document is invalid",
+        )
+
+    # --------------------------------------------------------
+    # Separate ciphertext and authentication tag
+    # --------------------------------------------------------
+
+    ciphertext = encrypted_data[:-16]
+    tag = encrypted_data[-16:]
+
+    # --------------------------------------------------------
+    # Reconstruct encrypted blob
+    #
+    # nonce comes from DocumentVersion.
+    # wrapped_key comes from EncryptionKey.
+    # --------------------------------------------------------
+
+    blob = EncryptedBlob(
+        ciphertext=ciphertext,
+        nonce=version.nonce,
+        tag=tag,
+        wrapped_key=encryption_key.wrapped_key,
+        key_version=encryption_key.key_version,
+    )
+
+    # --------------------------------------------------------
+    # Decrypt
+    # --------------------------------------------------------
+
+    try:
+        plaintext = decrypt_file(
+            blob,
+            get_master_key(),
+        )
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to decrypt document",
+        )
+
+    # --------------------------------------------------------
+    # Return original file
     # --------------------------------------------------------
 
     return StreamingResponse(
-        io.BytesIO(data),
+        io.BytesIO(plaintext),
         media_type=(
             doc.mime_type
             or "application/octet-stream"
