@@ -14,35 +14,29 @@ def encrypt_file(
     Encrypt a file using envelope encryption.
 
     A random AES-256 data key is generated for every file.
-    The data key is then encrypted using the master key.
+    The data key is then wrapped using the master key.
     """
 
-    # ---------------------------------------------------------
-    # 1. Generate a random AES-256 key for this file
-    # ---------------------------------------------------------
+    # Random per-file AES-256 key
     data_key = AESGCM.generate_key(bit_length=256)
 
-    # ---------------------------------------------------------
-    # 2. Encrypt the file using AES-256-GCM
-    # ---------------------------------------------------------
+    # Random 12-byte GCM nonce
     nonce = os.urandom(12)
 
+    # Encrypt file
     aesgcm = AESGCM(data_key)
 
-    # AESGCM.encrypt() returns ciphertext + 16-byte authentication tag
     encrypted = aesgcm.encrypt(
         nonce,
         plaintext,
         None,
     )
 
-    # Separate ciphertext and authentication tag
+    # AES-GCM returns ciphertext + 16-byte authentication tag
     ciphertext = encrypted[:-16]
     tag = encrypted[-16:]
 
-    # ---------------------------------------------------------
-    # 3. Wrap/encrypt the per-file data key using master key
-    # ---------------------------------------------------------
+    # Wrap the per-file data key using master key
     wrapper = AESGCM(master_key)
 
     wrap_nonce = os.urandom(12)
@@ -53,12 +47,9 @@ def encrypt_file(
         None,
     )
 
-    # Store the nonce together with the wrapped key
+    # Store wrap nonce + wrapped key
     wrapped_key = wrap_nonce + wrapped_data_key
 
-    # ---------------------------------------------------------
-    # 4. Return encryption metadata
-    # ---------------------------------------------------------
     return EncryptedBlob(
         ciphertext=ciphertext,
         nonce=nonce,
