@@ -417,6 +417,7 @@ def download_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    
 
     # --------------------------------------------------------
     # Find document
@@ -566,7 +567,154 @@ def download_document(
         },
     )
 
+# ============================================================
+# Verify document integrity
+# ============================================================
 
+@router.get(
+    "/{doc_id}/verify",
+    dependencies=[
+        Depends(
+            require_permission("document:read")
+        )
+    ],
+)
+def verify_integrity(
+    doc_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Find document
+    # --------------------------------------------------------
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    # --------------------------------------------------------
+    # Get latest version
+    # --------------------------------------------------------
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.document_id == doc.id
+        )
+        .order_by(
+            DocumentVersion.version_number.desc()
+        )
+        .first()
+    )
+
+    if not version:
+        raise HTTPException(
+            status_code=404,
+            detail="Document version not found",
+        )
+
+    # --------------------------------------------------------
+    # Get encryption metadata
+    # --------------------------------------------------------
+
+    encryption_key = (
+        db.query(EncryptionKey)
+        .filter(
+            EncryptionKey.document_version_id
+            == version.id
+        )
+        .first()
+    )
+
+    if not encryption_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Encryption metadata not found",
+        )
+
+    # --------------------------------------------------------
+    # Get encrypted file from storage
+    # --------------------------------------------------------
+
+    try:
+        encrypted_data = storage.get(
+            version.storage_key
+        )
+
+    except Exception:
+        raise HTTPException(
+            status_code=404,
+            detail="Document file not found in storage",
+        )
+
+    # --------------------------------------------------------
+    # Validate encrypted data
+    # --------------------------------------------------------
+
+    if len(encrypted_data) < 16:
+        raise HTTPException(
+            status_code=500,
+            detail="Stored encrypted document is invalid",
+        )
+
+    # --------------------------------------------------------
+    # Separate ciphertext and authentication tag
+    # --------------------------------------------------------
+
+    ciphertext = encrypted_data[:-16]
+    tag = encrypted_data[-16:]
+
+    # --------------------------------------------------------
+    # Reconstruct encrypted blob
+    # --------------------------------------------------------
+
+    blob = EncryptedBlob(
+        ciphertext=ciphertext,
+        nonce=version.nonce,
+        tag=tag,
+        wrapped_key=encryption_key.wrapped_key,
+        key_version=encryption_key.key_version,
+    )
+
+    # --------------------------------------------------------
+    # Decrypt document
+    # --------------------------------------------------------
+
+    try:
+        plaintext = decrypt_file(
+            blob,
+            get_master_key(),
+        )
+
+    except Exception:
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to decrypt document",
+        )
+
+    # --------------------------------------------------------
+    # Recompute SHA-256
+    # --------------------------------------------------------
+
+    computed_hash = sha256_hex(plaintext)
+
+    # --------------------------------------------------------
+    # Compare stored hash with computed hash
+    # --------------------------------------------------------
+
+    status = (
+        "VALID"
+        if computed_hash == version.sha256_hash
+        else "TAMPERED"
+    )
+
+    return {
+        "status": status,
+        "stored_hash": version.sha256_hash,
+        "computed_hash": computed_hash,
+    }
 # ============================================================
 # Rename document
 # ============================================================
