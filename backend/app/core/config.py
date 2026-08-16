@@ -1,21 +1,31 @@
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic_settings import (
+    BaseSettings,
+    SettingsConfigDict,
+)
 
 
 class Settings(BaseSettings):
+
     APP_NAME: str = "SecureFlow AI"
+
     APP_VERSION: str = "0.1.0"
+
     ENV: str = "development"
 
     DATABASE_URL: str = (
         "postgresql://secureflow:secureflow@localhost:5432/secureflow"
     )
 
-    JWT_SECRET: str = "dev-secret-change-in-production"
+    JWT_SECRET: str = (
+        "dev-secret-change-in-production"
+    )
 
-    REDIS_URL: str = "redis://localhost:6379/0"
+    REDIS_URL: str = (
+        "redis://localhost:6379/0"
+    )
 
-    ENCRYPTION_MASTER_KEY: str = (
-        "secureflow-ai-master-key-2026"
+    SIGNING_PRIVATE_KEY_PATH: str = (
+        "./storage/signing/private_key.pem"
     )
 
     model_config = SettingsConfigDict(
