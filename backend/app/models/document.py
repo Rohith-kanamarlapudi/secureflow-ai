@@ -1,6 +1,15 @@
 import uuid
 
-from sqlalchemy import Column, String, Boolean, ForeignKey, DateTime, Text, func
+from sqlalchemy import (
+    Column,
+    String,
+    Boolean,
+    ForeignKey,
+    DateTime,
+    Text,
+    LargeBinary,
+    func,
+)
 from sqlalchemy.dialects.postgresql import UUID, JSONB
 
 from app.db.session import Base
@@ -57,22 +66,27 @@ class DocumentVersion(Base):
     document_id = Column(
         UUID(as_uuid=True),
         ForeignKey("documents.id"),
+        nullable=False,
     )
 
     version_number = Column(
         String,
         nullable=False,
+        default="1",
     )
 
-    # Filled during Week 2 storage implementation
     storage_key = Column(
         String,
         nullable=True,
     )
 
-    # Filled during Week 2 integrity implementation
+    nonce = Column(
+        LargeBinary,
+        nullable=False,
+    )
+
     sha256_hash = Column(
-        String,
+        String(64),
         nullable=True,
     )
 
@@ -91,24 +105,21 @@ class EncryptionKey(Base):
         default=uuid.uuid4,
     )
 
-    organization_id = Column(
+    document_version_id = Column(
         UUID(as_uuid=True),
-        ForeignKey("organizations.id"),
-    )
-
-    key_name = Column(
-        String,
+        ForeignKey("document_versions.id"),
         nullable=False,
     )
 
-    encrypted_key = Column(
-        Text,
-        nullable=True,
+    wrapped_key = Column(
+        LargeBinary,
+        nullable=False,
     )
 
-    algorithm = Column(
+    key_version = Column(
         String,
-        nullable=True,
+        nullable=False,
+        default="v1",
     )
 
     created_at = Column(
@@ -129,21 +140,37 @@ class Signature(Base):
     document_version_id = Column(
         UUID(as_uuid=True),
         ForeignKey("document_versions.id"),
+        nullable=False,
     )
 
     signer_id = Column(
         UUID(as_uuid=True),
         ForeignKey("users.id"),
+        nullable=False,
     )
 
+    # Base64 encoded RSA-PSS signature
     signature = Column(
         Text,
-        nullable=True,
+        nullable=False,
+    )
+
+    # SHA-256 hash that was signed
+    hash_at_signing = Column(
+        String(64),
+        nullable=False,
+    )
+
+    # Base64 encoded PEM public key
+    public_key = Column(
+        Text,
+        nullable=False,
     )
 
     algorithm = Column(
         String,
-        nullable=True,
+        nullable=False,
+        default="RSA-PSS-SHA256",
     )
 
     created_at = Column(
