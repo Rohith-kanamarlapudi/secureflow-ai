@@ -8,8 +8,11 @@ from fastapi import (
     UploadFile,
     File,
 )
+
 from fastapi.responses import StreamingResponse
+
 from pydantic import BaseModel
+
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
@@ -20,7 +23,9 @@ from app.models.document import (
     Document,
     DocumentVersion,
     EncryptionKey,
+    Signature,
 )
+
 from app.models.user import User
 
 from app.storage.local import LocalStorage
@@ -30,6 +35,18 @@ from app.crypto.aes_service import encrypt_file
 from app.crypto.decrypt_service import decrypt_file
 from app.crypto.master_key import get_master_key
 from app.crypto.hashing import sha256_hex
+
+from app.crypto.signing import (
+    sign_hash,
+    verify_signature,
+    encode_signature,
+    decode_signature,
+    encode_public_key,
+    decode_public_key,
+    load_public_key,
+)
+
+from app.crypto.signer import get_private_key
 
 
 router = APIRouter(
@@ -49,7 +66,8 @@ storage = LocalStorage("./storage")
 # Upload validation
 # ============================================================
 
-MAX_SIZE = 50 * 1024 * 1024  # 50 MB
+MAX_SIZE = 50 * 1024 * 1024
+
 
 ALLOWED_MIME = {
     "application/pdf",
@@ -83,7 +101,8 @@ def _get_owned_or_404(
         db.query(Document)
         .filter(
             Document.id == doc_id,
-            Document.organization_id == current_user.organization_id,
+            Document.organization_id
+            == current_user.organization_id,
         )
         .first()
     )
@@ -105,10 +124,11 @@ def _get_latest_version(
     version = (
         db.query(DocumentVersion)
         .filter(
-            DocumentVersion.document_id == doc_id,
+            DocumentVersion.document_id
+            == doc_id,
         )
         .order_by(
-            DocumentVersion.version_number.desc()
+            DocumentVersion.created_at.desc()
         )
         .first()
     )
@@ -130,7 +150,8 @@ def _get_encryption_key(
     encryption_key = (
         db.query(EncryptionKey)
         .filter(
-            EncryptionKey.document_version_id == version_id,
+            EncryptionKey.document_version_id
+            == version_id,
         )
         .first()
     )
@@ -150,7 +171,6 @@ def _build_encrypted_blob(
     encryption_key: EncryptionKey,
 ) -> EncryptedBlob:
 
-    # AES-GCM authentication tag is 16 bytes.
     if len(encrypted_data) < 16:
         raise HTTPException(
             status_code=500,
@@ -158,6 +178,7 @@ def _build_encrypted_blob(
         )
 
     ciphertext = encrypted_data[:-16]
+
     tag = encrypted_data[-16:]
 
     return EncryptedBlob(
@@ -187,30 +208,24 @@ async def upload_document(
     current_user: User = Depends(get_current_user),
 ):
 
-    # --------------------------------------------------------
-    # Validate MIME type
-    # --------------------------------------------------------
-
     if file.content_type not in ALLOWED_MIME:
         raise HTTPException(
             status_code=415,
-            detail=f"Unsupported file type: {file.content_type}",
+            detail=(
+                f"Unsupported file type: "
+                f"{file.content_type}"
+            ),
         )
 
-    # --------------------------------------------------------
-    # Read file
-    # --------------------------------------------------------
-
     data = await file.read()
-
-    # --------------------------------------------------------
-    # Validate size
-    # --------------------------------------------------------
 
     if len(data) > MAX_SIZE:
         raise HTTPException(
             status_code=413,
-            detail="File too large. Maximum size is 50 MB.",
+            detail=(
+                "File too large. "
+                "Maximum size is 50 MB."
+            ),
         )
 
     if len(data) == 0:
@@ -220,10 +235,12 @@ async def upload_document(
         )
 
     # --------------------------------------------------------
-    # Calculate SHA-256 BEFORE encryption
+    # SHA-256
     # --------------------------------------------------------
 
-    sha256_hash = sha256_hex(data)
+    sha256_hash = sha256_hex(
+        data
+    )
 
     # --------------------------------------------------------
     # Create document
@@ -240,7 +257,7 @@ async def upload_document(
     db.flush()
 
     # --------------------------------------------------------
-    # Generate storage key
+    # Storage key
     # --------------------------------------------------------
 
     storage_key = (
@@ -250,61 +267,76 @@ async def upload_document(
     )
 
     # --------------------------------------------------------
-    # Encrypt file
+    # Encrypt
     # --------------------------------------------------------
 
     try:
+
         blob = encrypt_file(
             plaintext=data,
             master_key=get_master_key(),
             key_version="v1",
         )
+
     except Exception as exc:
+
         db.rollback()
 
         raise HTTPException(
             status_code=500,
-            detail=f"Encryption failed: {str(exc)}",
+            detail=f"Encryption failed: {exc}",
         )
 
     # --------------------------------------------------------
-    # Store ciphertext + authentication tag
+    # Store encrypted data
     # --------------------------------------------------------
 
-    encrypted_data = blob.ciphertext + blob.tag
+    encrypted_data = (
+        blob.ciphertext
+        + blob.tag
+    )
 
     try:
+
         storage.put(
             storage_key,
             encrypted_data,
-            file.content_type or "application/octet-stream",
+            file.content_type
+            or "application/octet-stream",
         )
+
     except Exception as exc:
+
         db.rollback()
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to store encrypted document: {str(exc)}",
+            detail=(
+                f"Failed to store encrypted "
+                f"document: {exc}"
+            ),
         )
 
     # --------------------------------------------------------
-    # Create DocumentVersion
+    # Create version
     # --------------------------------------------------------
 
     try:
+
         version = DocumentVersion(
             document_id=doc.id,
-            version_number=1,
+            version_number="1",
             storage_key=storage_key,
             nonce=blob.nonce,
             sha256_hash=sha256_hash,
         )
 
         db.add(version)
+
         db.flush()
 
         # ----------------------------------------------------
-        # Create EncryptionKey metadata
+        # Encryption metadata
         # ----------------------------------------------------
 
         encryption_key = EncryptionKey(
@@ -315,31 +347,28 @@ async def upload_document(
 
         db.add(encryption_key)
 
-        # ----------------------------------------------------
-        # Commit database transaction
-        # ----------------------------------------------------
-
         db.commit()
+
         db.refresh(doc)
 
     except Exception as exc:
+
         db.rollback()
 
-        # Database failed after object was stored.
-        # Remove the orphaned encrypted object.
         try:
-            storage.delete(storage_key)
+            storage.delete(
+                storage_key
+            )
         except Exception:
             pass
 
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to save document metadata: {str(exc)}",
+            detail=(
+                f"Failed to save document "
+                f"metadata: {exc}"
+            ),
         )
-
-    # --------------------------------------------------------
-    # Response
-    # --------------------------------------------------------
 
     return {
         "id": str(doc.id),
@@ -348,7 +377,7 @@ async def upload_document(
         "size": len(data),
         "sha256_hash": sha256_hash,
         "storage_key": storage_key,
-        "version": 1,
+        "version": "1",
         "encrypted": True,
         "key_version": blob.key_version,
     }
@@ -378,24 +407,31 @@ def list_documents(
     if page < 1:
         raise HTTPException(
             status_code=400,
-            detail="page must be greater than or equal to 1",
+            detail=(
+                "page must be greater than "
+                "or equal to 1"
+            ),
         )
 
     if size < 1 or size > 100:
         raise HTTPException(
             status_code=400,
-            detail="size must be between 1 and 100",
+            detail=(
+                "size must be between 1 and 100"
+            ),
         )
 
     query = (
         db.query(Document)
         .filter(
-            Document.organization_id == current_user.organization_id,
+            Document.organization_id
+            == current_user.organization_id,
             Document.is_archived.is_(False),
         )
     )
 
     if filename:
+
         query = query.filter(
             Document.filename.ilike(
                 f"%{filename}%"
@@ -403,16 +439,19 @@ def list_documents(
         )
 
     if sort == "-created_at":
+
         query = query.order_by(
             Document.created_at.desc()
         )
 
     elif sort == "created_at":
+
         query = query.order_by(
             Document.created_at.asc()
         )
 
     else:
+
         raise HTTPException(
             status_code=400,
             detail=(
@@ -421,14 +460,12 @@ def list_documents(
             ),
         )
 
-    documents = (
+    return (
         query
         .offset((page - 1) * size)
         .limit(size)
         .all()
     )
-
-    return documents
 
 
 # ============================================================
@@ -460,7 +497,9 @@ def get_document(
         "filename": doc.filename,
         "mime_type": doc.mime_type,
         "owner_id": str(doc.owner_id),
-        "organization_id": str(doc.organization_id),
+        "organization_id": str(
+            doc.organization_id
+        ),
         "is_archived": doc.is_archived,
         "created_at": doc.created_at,
     }
@@ -484,51 +523,37 @@ def download_document(
     current_user: User = Depends(get_current_user),
 ):
 
-    # --------------------------------------------------------
-    # Get document
-    # --------------------------------------------------------
-
     doc = _get_owned_or_404(
         db,
         doc_id,
         current_user,
     )
 
-    # --------------------------------------------------------
-    # Get latest version
-    # --------------------------------------------------------
-
     version = _get_latest_version(
         db,
         doc.id,
     )
-
-    # --------------------------------------------------------
-    # Get encryption metadata
-    # --------------------------------------------------------
 
     encryption_key = _get_encryption_key(
         db,
         version.id,
     )
 
-    # --------------------------------------------------------
-    # Read encrypted object
-    # --------------------------------------------------------
-
     try:
+
         encrypted_data = storage.get(
             version.storage_key
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=404,
-            detail="Document file not found in storage",
+            detail=(
+                "Document file not found "
+                "in storage"
+            ),
         )
-
-    # --------------------------------------------------------
-    # Reconstruct encrypted blob
-    # --------------------------------------------------------
 
     blob = _build_encrypted_blob(
         encrypted_data,
@@ -536,37 +561,38 @@ def download_document(
         encryption_key,
     )
 
-    # --------------------------------------------------------
-    # Decrypt
-    # --------------------------------------------------------
-
     try:
+
         plaintext = decrypt_file(
             blob,
             get_master_key(),
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=500,
             detail="Failed to decrypt document",
         )
 
-    # --------------------------------------------------------
-    # Verify SHA-256 integrity
-    # --------------------------------------------------------
-
     if version.sha256_hash:
-        calculated_hash = sha256_hex(plaintext)
 
-        if calculated_hash != version.sha256_hash:
+        calculated_hash = sha256_hex(
+            plaintext
+        )
+
+        if (
+            calculated_hash
+            != version.sha256_hash
+        ):
+
             raise HTTPException(
                 status_code=500,
-                detail="Document integrity verification failed",
+                detail=(
+                    "Document integrity "
+                    "verification failed"
+                ),
             )
-
-    # --------------------------------------------------------
-    # Return original file
-    # --------------------------------------------------------
 
     return StreamingResponse(
         io.BytesIO(plaintext),
@@ -576,7 +602,8 @@ def download_document(
         ),
         headers={
             "Content-Disposition": (
-                f'attachment; filename="{doc.filename}"'
+                f'attachment; '
+                f'filename="{doc.filename}"'
             )
         },
     )
@@ -600,51 +627,37 @@ def verify_integrity(
     current_user: User = Depends(get_current_user),
 ):
 
-    # --------------------------------------------------------
-    # Get document
-    # --------------------------------------------------------
-
     doc = _get_owned_or_404(
         db,
         doc_id,
         current_user,
     )
 
-    # --------------------------------------------------------
-    # Get latest version
-    # --------------------------------------------------------
-
     version = _get_latest_version(
         db,
         doc.id,
     )
-
-    # --------------------------------------------------------
-    # Get encryption metadata
-    # --------------------------------------------------------
 
     encryption_key = _get_encryption_key(
         db,
         version.id,
     )
 
-    # --------------------------------------------------------
-    # Get encrypted object
-    # --------------------------------------------------------
-
     try:
+
         encrypted_data = storage.get(
             version.storage_key
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=404,
-            detail="Document file not found in storage",
+            detail=(
+                "Document file not found "
+                "in storage"
+            ),
         )
-
-    # --------------------------------------------------------
-    # Reconstruct encrypted blob
-    # --------------------------------------------------------
 
     blob = _build_encrypted_blob(
         encrypted_data,
@@ -652,36 +665,37 @@ def verify_integrity(
         encryption_key,
     )
 
-    # --------------------------------------------------------
-    # Decrypt
-    # --------------------------------------------------------
-
     try:
+
         plaintext = decrypt_file(
             blob,
             get_master_key(),
         )
+
     except Exception:
+
         raise HTTPException(
             status_code=500,
             detail="Failed to decrypt document",
         )
 
-    # --------------------------------------------------------
-    # Recompute SHA-256
-    # --------------------------------------------------------
-
-    computed_hash = sha256_hex(plaintext)
-
-    # --------------------------------------------------------
-    # Compare hashes
-    # --------------------------------------------------------
+    computed_hash = sha256_hex(
+        plaintext
+    )
 
     if not version.sha256_hash:
+
         status = "NO_HASH"
-    elif computed_hash == version.sha256_hash:
+
+    elif (
+        computed_hash
+        == version.sha256_hash
+    ):
+
         status = "VALID"
+
     else:
+
         status = "TAMPERED"
 
     return {
@@ -690,6 +704,327 @@ def verify_integrity(
         "computed_hash": computed_hash,
         "document_id": str(doc.id),
         "version": version.version_number,
+    }
+
+
+# ============================================================
+# Sign document version
+# ============================================================
+
+@router.post(
+    "/{doc_id}/versions/{version_id}/sign",
+    dependencies=[
+        Depends(
+            require_permission("document:update")
+        )
+    ],
+)
+def sign_document_version(
+    doc_id: UUID,
+    version_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.id == version_id,
+            DocumentVersion.document_id
+            == doc.id,
+        )
+        .first()
+    )
+
+    if not version:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Document version not found",
+        )
+
+    if not version.sha256_hash:
+
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "Document version has "
+                "no SHA-256 hash"
+            ),
+        )
+
+    existing_signature = (
+        db.query(Signature)
+        .filter(
+            Signature.document_version_id
+            == version.id,
+        )
+        .first()
+    )
+
+    if existing_signature:
+
+        return {
+            "status": "already_signed",
+            "signature_id": str(
+                existing_signature.id
+            ),
+            "document_id": str(doc.id),
+            "version_id": str(version.id),
+        }
+
+    try:
+
+        private_key = get_private_key()
+
+        public_key = (
+            private_key.public_key()
+        )
+
+        signature_bytes = sign_hash(
+            private_key,
+            version.sha256_hash,
+        )
+
+        public_key_pem = (
+            public_key.public_bytes(
+                encoding=__import__(
+                    "cryptography.hazmat.primitives.serialization",
+                    fromlist=["Encoding"],
+                ).Encoding.PEM,
+                format=__import__(
+                    "cryptography.hazmat.primitives.serialization",
+                    fromlist=["PublicFormat"],
+                ).PublicFormat.SubjectPublicKeyInfo,
+            )
+        )
+
+    except Exception as exc:
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Signing failed: {exc}",
+        )
+
+    signature = Signature(
+        document_version_id=version.id,
+        signer_id=current_user.id,
+        signature=encode_signature(
+            signature_bytes
+        ),
+        hash_at_signing=version.sha256_hash,
+        public_key=encode_public_key(
+            public_key_pem
+        ),
+        algorithm="RSA-PSS-SHA256",
+    )
+
+    try:
+
+        db.add(signature)
+
+        db.commit()
+
+        db.refresh(signature)
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to save signature: "
+                f"{exc}"
+            ),
+        )
+
+    return {
+        "status": "signed",
+        "signature_id": str(
+            signature.id
+        ),
+        "document_id": str(doc.id),
+        "version_id": str(version.id),
+        "signer_id": str(
+            current_user.id
+        ),
+        "algorithm": signature.algorithm,
+        "hash_at_signing": (
+            signature.hash_at_signing
+        ),
+        "created_at": signature.created_at,
+    }
+
+
+# ============================================================
+# Verify digital signature
+# ============================================================
+
+@router.get(
+    "/{doc_id}/versions/{version_id}/signature",
+    dependencies=[
+        Depends(
+            require_permission("document:read")
+        )
+    ],
+)
+def verify_signature_status(
+    doc_id: UUID,
+    version_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.id == version_id,
+            DocumentVersion.document_id
+            == doc.id,
+        )
+        .first()
+    )
+
+    if not version:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Document version not found",
+        )
+
+    signature = (
+        db.query(Signature)
+        .filter(
+            Signature.document_version_id
+            == version.id,
+        )
+        .first()
+    )
+
+    if not signature:
+
+        raise HTTPException(
+            status_code=404,
+            detail="Signature not found",
+        )
+
+    encryption_key = _get_encryption_key(
+        db,
+        version.id,
+    )
+
+    try:
+
+        encrypted_data = storage.get(
+            version.storage_key
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "Document file not found "
+                "in storage"
+            ),
+        )
+
+    blob = _build_encrypted_blob(
+        encrypted_data,
+        version,
+        encryption_key,
+    )
+
+    try:
+
+        plaintext = decrypt_file(
+            blob,
+            get_master_key(),
+        )
+
+    except Exception:
+
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to decrypt document",
+        )
+
+    computed_hash = sha256_hex(
+        plaintext
+    )
+
+    modified = (
+        computed_hash
+        != signature.hash_at_signing
+    )
+
+    try:
+
+        public_key = load_public_key(
+            decode_public_key(
+                signature.public_key
+            )
+        )
+
+        signature_bytes = (
+            decode_signature(
+                signature.signature
+            )
+        )
+
+        cryptographic_signature_valid = (
+            verify_signature(
+                public_key,
+                signature_bytes,
+                signature.hash_at_signing,
+            )
+        )
+
+    except Exception:
+
+        cryptographic_signature_valid = False
+
+    valid = (
+        cryptographic_signature_valid
+        and not modified
+    )
+
+    status = (
+        "VALID"
+        if valid
+        else "INVALID"
+    )
+
+    return {
+        "status": status,
+        "signer": str(
+            signature.signer_id
+        ),
+        "signed_at": signature.created_at,
+        "modified": modified,
+        "signature_valid": (
+            cryptographic_signature_valid
+        ),
+        "stored_hash": (
+            signature.hash_at_signing
+        ),
+        "computed_hash": computed_hash,
+        "document_id": str(doc.id),
+        "version": version.version_number,
+        "algorithm": signature.algorithm,
     }
 
 
@@ -722,6 +1057,7 @@ def update_document(
         doc.filename = payload.filename
 
     db.commit()
+
     db.refresh(doc)
 
     return {
