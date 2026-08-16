@@ -70,7 +70,7 @@ class DocumentUpdateIn(BaseModel):
 
 
 # ============================================================
-# Helper
+# Helpers
 # ============================================================
 
 def _get_owned_or_404(
@@ -95,6 +95,78 @@ def _get_owned_or_404(
         )
 
     return doc
+
+
+def _get_latest_version(
+    db: Session,
+    doc_id: UUID,
+) -> DocumentVersion:
+
+    version = (
+        db.query(DocumentVersion)
+        .filter(
+            DocumentVersion.document_id == doc_id,
+        )
+        .order_by(
+            DocumentVersion.version_number.desc()
+        )
+        .first()
+    )
+
+    if not version:
+        raise HTTPException(
+            status_code=404,
+            detail="Document version not found",
+        )
+
+    return version
+
+
+def _get_encryption_key(
+    db: Session,
+    version_id: UUID,
+) -> EncryptionKey:
+
+    encryption_key = (
+        db.query(EncryptionKey)
+        .filter(
+            EncryptionKey.document_version_id == version_id,
+        )
+        .first()
+    )
+
+    if not encryption_key:
+        raise HTTPException(
+            status_code=404,
+            detail="Encryption metadata not found",
+        )
+
+    return encryption_key
+
+
+def _build_encrypted_blob(
+    encrypted_data: bytes,
+    version: DocumentVersion,
+    encryption_key: EncryptionKey,
+) -> EncryptedBlob:
+
+    # AES-GCM authentication tag is 16 bytes.
+    if len(encrypted_data) < 16:
+        raise HTTPException(
+            status_code=500,
+            detail="Stored encrypted document is invalid",
+        )
+
+    ciphertext = encrypted_data[:-16]
+    tag = encrypted_data[-16:]
+
+    return EncryptedBlob(
+        ciphertext=ciphertext,
+        nonce=version.nonce,
+        tag=tag,
+        wrapped_key=encryption_key.wrapped_key,
+        key_version=encryption_key.key_version,
+    )
 
 
 # ============================================================
@@ -132,7 +204,7 @@ async def upload_document(
     data = await file.read()
 
     # --------------------------------------------------------
-    # Validate file size
+    # Validate size
     # --------------------------------------------------------
 
     if len(data) > MAX_SIZE:
@@ -148,16 +220,13 @@ async def upload_document(
         )
 
     # --------------------------------------------------------
-    # Calculate SHA-256 hash
-    #
-    # This happens before encryption so the hash represents
-    # the original uploaded file.
+    # Calculate SHA-256 BEFORE encryption
     # --------------------------------------------------------
 
     sha256_hash = sha256_hex(data)
 
     # --------------------------------------------------------
-    # Create document metadata
+    # Create document
     # --------------------------------------------------------
 
     doc = Document(
@@ -184,20 +253,25 @@ async def upload_document(
     # Encrypt file
     # --------------------------------------------------------
 
-    blob = encrypt_file(
-        plaintext=data,
-        master_key=get_master_key(),
-        key_version="v1",
-    )
+    try:
+        blob = encrypt_file(
+            plaintext=data,
+            master_key=get_master_key(),
+            key_version="v1",
+        )
+    except Exception as exc:
+        db.rollback()
 
-    # AES-GCM returns ciphertext + authentication tag.
-    # Store both in object storage.
+        raise HTTPException(
+            status_code=500,
+            detail=f"Encryption failed: {str(exc)}",
+        )
+
+    # --------------------------------------------------------
+    # Store ciphertext + authentication tag
+    # --------------------------------------------------------
 
     encrypted_data = blob.ciphertext + blob.tag
-
-    # --------------------------------------------------------
-    # Store encrypted object
-    # --------------------------------------------------------
 
     try:
         storage.put(
@@ -205,7 +279,6 @@ async def upload_document(
             encrypted_data,
             file.content_type or "application/octet-stream",
         )
-
     except Exception as exc:
         db.rollback()
 
@@ -215,58 +288,54 @@ async def upload_document(
         )
 
     # --------------------------------------------------------
-    # Create document version
-    #
-    # nonce + SHA-256 hash belong to DocumentVersion.
-    # --------------------------------------------------------
-
-    version = DocumentVersion(
-        document_id=doc.id,
-        version_number=1,
-        storage_key=storage_key,
-        nonce=blob.nonce,
-        sha256_hash=sha256_hash,
-    )
-
-    db.add(version)
-    db.flush()
-
-    # --------------------------------------------------------
-    # Store encryption metadata
-    #
-    # EncryptionKey stores:
-    # - wrapped_key
-    # - key_version
-    #
-    # nonce is stored on DocumentVersion.
-    # --------------------------------------------------------
-
-    encryption_key = EncryptionKey(
-        document_version_id=version.id,
-        wrapped_key=blob.wrapped_key,
-        key_version=blob.key_version,
-    )
-
-    db.add(encryption_key)
-
-    # --------------------------------------------------------
-    # Commit metadata
+    # Create DocumentVersion
     # --------------------------------------------------------
 
     try:
+        version = DocumentVersion(
+            document_id=doc.id,
+            version_number=1,
+            storage_key=storage_key,
+            nonce=blob.nonce,
+            sha256_hash=sha256_hash,
+        )
+
+        db.add(version)
+        db.flush()
+
+        # ----------------------------------------------------
+        # Create EncryptionKey metadata
+        # ----------------------------------------------------
+
+        encryption_key = EncryptionKey(
+            document_version_id=version.id,
+            wrapped_key=blob.wrapped_key,
+            key_version=blob.key_version,
+        )
+
+        db.add(encryption_key)
+
+        # ----------------------------------------------------
+        # Commit database transaction
+        # ----------------------------------------------------
+
         db.commit()
         db.refresh(doc)
 
-    except Exception:
+    except Exception as exc:
         db.rollback()
 
-        # Remove encrypted object if database commit fails
+        # Database failed after object was stored.
+        # Remove the orphaned encrypted object.
         try:
             storage.delete(storage_key)
         except Exception:
             pass
 
-        raise
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to save document metadata: {str(exc)}",
+        )
 
     # --------------------------------------------------------
     # Response
@@ -321,8 +390,7 @@ def list_documents(
     query = (
         db.query(Document)
         .filter(
-            Document.organization_id
-            == current_user.organization_id,
+            Document.organization_id == current_user.organization_id,
             Document.is_archived.is_(False),
         )
     )
@@ -392,9 +460,7 @@ def get_document(
         "filename": doc.filename,
         "mime_type": doc.mime_type,
         "owner_id": str(doc.owner_id),
-        "organization_id": str(
-            doc.organization_id
-        ),
+        "organization_id": str(doc.organization_id),
         "is_archived": doc.is_archived,
         "created_at": doc.created_at,
     }
@@ -417,10 +483,9 @@ def download_document(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    
 
     # --------------------------------------------------------
-    # Find document
+    # Get document
     # --------------------------------------------------------
 
     doc = _get_owned_or_404(
@@ -433,41 +498,19 @@ def download_document(
     # Get latest version
     # --------------------------------------------------------
 
-    version = (
-        db.query(DocumentVersion)
-        .filter(
-            DocumentVersion.document_id == doc.id
-        )
-        .order_by(
-            DocumentVersion.version_number.desc()
-        )
-        .first()
+    version = _get_latest_version(
+        db,
+        doc.id,
     )
-
-    if not version:
-        raise HTTPException(
-            status_code=404,
-            detail="Document version not found",
-        )
 
     # --------------------------------------------------------
     # Get encryption metadata
     # --------------------------------------------------------
 
-    encryption_key = (
-        db.query(EncryptionKey)
-        .filter(
-            EncryptionKey.document_version_id
-            == version.id
-        )
-        .first()
+    encryption_key = _get_encryption_key(
+        db,
+        version.id,
     )
-
-    if not encryption_key:
-        raise HTTPException(
-            status_code=404,
-            detail="Encryption metadata not found",
-        )
 
     # --------------------------------------------------------
     # Read encrypted object
@@ -477,7 +520,6 @@ def download_document(
         encrypted_data = storage.get(
             version.storage_key
         )
-
     except Exception:
         raise HTTPException(
             status_code=404,
@@ -485,37 +527,13 @@ def download_document(
         )
 
     # --------------------------------------------------------
-    # Validate encrypted data
-    #
-    # AES-GCM authentication tag is 16 bytes.
-    # --------------------------------------------------------
-
-    if len(encrypted_data) < 16:
-        raise HTTPException(
-            status_code=500,
-            detail="Stored encrypted document is invalid",
-        )
-
-    # --------------------------------------------------------
-    # Separate ciphertext and authentication tag
-    # --------------------------------------------------------
-
-    ciphertext = encrypted_data[:-16]
-    tag = encrypted_data[-16:]
-
-    # --------------------------------------------------------
     # Reconstruct encrypted blob
-    #
-    # nonce comes from DocumentVersion.
-    # wrapped_key comes from EncryptionKey.
     # --------------------------------------------------------
 
-    blob = EncryptedBlob(
-        ciphertext=ciphertext,
-        nonce=version.nonce,
-        tag=tag,
-        wrapped_key=encryption_key.wrapped_key,
-        key_version=encryption_key.key_version,
+    blob = _build_encrypted_blob(
+        encrypted_data,
+        version,
+        encryption_key,
     )
 
     # --------------------------------------------------------
@@ -527,7 +545,6 @@ def download_document(
             blob,
             get_master_key(),
         )
-
     except Exception:
         raise HTTPException(
             status_code=500,
@@ -536,9 +553,6 @@ def download_document(
 
     # --------------------------------------------------------
     # Verify SHA-256 integrity
-    #
-    # Recompute the hash from the decrypted original
-    # file and compare it with the stored hash.
     # --------------------------------------------------------
 
     if version.sha256_hash:
@@ -567,6 +581,7 @@ def download_document(
         },
     )
 
+
 # ============================================================
 # Verify document integrity
 # ============================================================
@@ -584,8 +599,9 @@ def verify_integrity(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+
     # --------------------------------------------------------
-    # Find document
+    # Get document
     # --------------------------------------------------------
 
     doc = _get_owned_or_404(
@@ -598,51 +614,28 @@ def verify_integrity(
     # Get latest version
     # --------------------------------------------------------
 
-    version = (
-        db.query(DocumentVersion)
-        .filter(
-            DocumentVersion.document_id == doc.id
-        )
-        .order_by(
-            DocumentVersion.version_number.desc()
-        )
-        .first()
+    version = _get_latest_version(
+        db,
+        doc.id,
     )
-
-    if not version:
-        raise HTTPException(
-            status_code=404,
-            detail="Document version not found",
-        )
 
     # --------------------------------------------------------
     # Get encryption metadata
     # --------------------------------------------------------
 
-    encryption_key = (
-        db.query(EncryptionKey)
-        .filter(
-            EncryptionKey.document_version_id
-            == version.id
-        )
-        .first()
+    encryption_key = _get_encryption_key(
+        db,
+        version.id,
     )
 
-    if not encryption_key:
-        raise HTTPException(
-            status_code=404,
-            detail="Encryption metadata not found",
-        )
-
     # --------------------------------------------------------
-    # Get encrypted file from storage
+    # Get encrypted object
     # --------------------------------------------------------
 
     try:
         encrypted_data = storage.get(
             version.storage_key
         )
-
     except Exception:
         raise HTTPException(
             status_code=404,
@@ -650,36 +643,17 @@ def verify_integrity(
         )
 
     # --------------------------------------------------------
-    # Validate encrypted data
-    # --------------------------------------------------------
-
-    if len(encrypted_data) < 16:
-        raise HTTPException(
-            status_code=500,
-            detail="Stored encrypted document is invalid",
-        )
-
-    # --------------------------------------------------------
-    # Separate ciphertext and authentication tag
-    # --------------------------------------------------------
-
-    ciphertext = encrypted_data[:-16]
-    tag = encrypted_data[-16:]
-
-    # --------------------------------------------------------
     # Reconstruct encrypted blob
     # --------------------------------------------------------
 
-    blob = EncryptedBlob(
-        ciphertext=ciphertext,
-        nonce=version.nonce,
-        tag=tag,
-        wrapped_key=encryption_key.wrapped_key,
-        key_version=encryption_key.key_version,
+    blob = _build_encrypted_blob(
+        encrypted_data,
+        version,
+        encryption_key,
     )
 
     # --------------------------------------------------------
-    # Decrypt document
+    # Decrypt
     # --------------------------------------------------------
 
     try:
@@ -687,7 +661,6 @@ def verify_integrity(
             blob,
             get_master_key(),
         )
-
     except Exception:
         raise HTTPException(
             status_code=500,
@@ -701,20 +674,25 @@ def verify_integrity(
     computed_hash = sha256_hex(plaintext)
 
     # --------------------------------------------------------
-    # Compare stored hash with computed hash
+    # Compare hashes
     # --------------------------------------------------------
 
-    status = (
-        "VALID"
-        if computed_hash == version.sha256_hash
-        else "TAMPERED"
-    )
+    if not version.sha256_hash:
+        status = "NO_HASH"
+    elif computed_hash == version.sha256_hash:
+        status = "VALID"
+    else:
+        status = "TAMPERED"
 
     return {
         "status": status,
         "stored_hash": version.sha256_hash,
         "computed_hash": computed_hash,
+        "document_id": str(doc.id),
+        "version": version.version_number,
     }
+
+
 # ============================================================
 # Rename document
 # ============================================================
