@@ -16,7 +16,6 @@ from app.api.auth import get_current_user
 from app.api.deps import require_permission
 from app.db.session import get_db
 
-# EncryptionKey is in document.py in your project
 from app.models.document import (
     Document,
     DocumentVersion,
@@ -30,6 +29,7 @@ from app.crypto.base import EncryptedBlob
 from app.crypto.aes_service import encrypt_file
 from app.crypto.decrypt_service import decrypt_file
 from app.crypto.master_key import get_master_key
+from app.crypto.hashing import sha256_hex
 
 
 router = APIRouter(
@@ -148,6 +148,15 @@ async def upload_document(
         )
 
     # --------------------------------------------------------
+    # Calculate SHA-256 hash
+    #
+    # This happens before encryption so the hash represents
+    # the original uploaded file.
+    # --------------------------------------------------------
+
+    sha256_hash = sha256_hex(data)
+
+    # --------------------------------------------------------
     # Create document metadata
     # --------------------------------------------------------
 
@@ -183,6 +192,7 @@ async def upload_document(
 
     # AES-GCM returns ciphertext + authentication tag.
     # Store both in object storage.
+
     encrypted_data = blob.ciphertext + blob.tag
 
     # --------------------------------------------------------
@@ -207,7 +217,7 @@ async def upload_document(
     # --------------------------------------------------------
     # Create document version
     #
-    # nonce belongs to DocumentVersion
+    # nonce + SHA-256 hash belong to DocumentVersion.
     # --------------------------------------------------------
 
     version = DocumentVersion(
@@ -215,6 +225,7 @@ async def upload_document(
         version_number=1,
         storage_key=storage_key,
         nonce=blob.nonce,
+        sha256_hash=sha256_hash,
     )
 
     db.add(version)
@@ -266,6 +277,7 @@ async def upload_document(
         "filename": doc.filename,
         "mime_type": doc.mime_type,
         "size": len(data),
+        "sha256_hash": sha256_hash,
         "storage_key": storage_key,
         "version": 1,
         "encrypted": True,
@@ -520,6 +532,22 @@ def download_document(
             status_code=500,
             detail="Failed to decrypt document",
         )
+
+    # --------------------------------------------------------
+    # Verify SHA-256 integrity
+    #
+    # Recompute the hash from the decrypted original
+    # file and compare it with the stored hash.
+    # --------------------------------------------------------
+
+    if version.sha256_hash:
+        calculated_hash = sha256_hex(plaintext)
+
+        if calculated_hash != version.sha256_hash:
+            raise HTTPException(
+                status_code=500,
+                detail="Document integrity verification failed",
+            )
 
     # --------------------------------------------------------
     # Return original file
