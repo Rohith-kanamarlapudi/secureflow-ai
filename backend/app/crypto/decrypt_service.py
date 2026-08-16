@@ -8,37 +8,26 @@ def decrypt_file(
     master_key: bytes,
 ) -> bytes:
     """
-    Decrypt a file using envelope encryption.
-
-    Steps:
-    1. Extract the wrapping nonce.
-    2. Unwrap/decrypt the per-file data key using the master key.
-    3. Decrypt the file ciphertext using the recovered data key.
+    Unwrap the per-file data key and decrypt the file.
     """
 
-    # ---------------------------------------------------------
-    # 1. Extract wrapping nonce and wrapped data key
-    # ---------------------------------------------------------
+    # First 12 bytes are the wrapping nonce
     wrap_nonce = blob.wrapped_key[:12]
+
+    # Remaining bytes are wrapped data key + GCM tag
     wrapped = blob.wrapped_key[12:]
 
-    # ---------------------------------------------------------
-    # 2. Recover the per-file AES-256 data key
-    # ---------------------------------------------------------
+    # Recover per-file AES-256 key
     data_key = AESGCM(master_key).decrypt(
         wrap_nonce,
         wrapped,
         None,
     )
 
-    # ---------------------------------------------------------
-    # 3. Reconstruct ciphertext + authentication tag
-    # ---------------------------------------------------------
+    # Reconstruct ciphertext + authentication tag
     encrypted = blob.ciphertext + blob.tag
 
-    # ---------------------------------------------------------
-    # 4. Decrypt the file
-    # ---------------------------------------------------------
+    # Decrypt original file
     plaintext = AESGCM(data_key).decrypt(
         blob.nonce,
         encrypted,
