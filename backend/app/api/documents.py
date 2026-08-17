@@ -1,57 +1,47 @@
+from datetime import datetime, timezone
+from io import BytesIO
 from uuid import UUID
-import io
 
 from fastapi import (
     APIRouter,
     Depends,
+    File,
     HTTPException,
     UploadFile,
-    File,
 )
-
 from fastapi.responses import StreamingResponse
-
 from pydantic import BaseModel
-
+from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
 from app.api.auth import get_current_user
 from app.api.deps import require_permission
+from app.crypto.aes_service import encrypt_file
+from app.crypto.base import EncryptedBlob
+from app.crypto.decrypt_service import decrypt_file
+from app.crypto.hashing import sha256_hex
+from app.crypto.master_key import get_master_key
+from app.crypto.signer import get_private_key
+from app.crypto.signing import (
+    decode_public_key,
+    decode_signature,
+    encode_public_key,
+    encode_signature,
+    load_public_key,
+    sign_hash,
+    verify_signature,
+)
 from app.db.session import get_db
-
 from app.models.document import (
     Document,
     DocumentVersion,
     EncryptionKey,
     Signature,
 )
-
-from app.models.user import User
-from app.models.document import Document, DocumentVersion
 from app.models.share import DocumentShare
-from app.schemas.share import ShareIn
-
 from app.models.user import User
-
+from app.schemas.share import ShareIn
 from app.storage.local import LocalStorage
-
-from app.crypto.base import EncryptedBlob
-from app.crypto.aes_service import encrypt_file
-from app.crypto.decrypt_service import decrypt_file
-from app.crypto.master_key import get_master_key
-from app.crypto.hashing import sha256_hex
-
-from app.crypto.signing import (
-    sign_hash,
-    verify_signature,
-    encode_signature,
-    decode_signature,
-    encode_public_key,
-    decode_public_key,
-    load_public_key,
-)
-
-from app.crypto.signer import get_private_key
 
 
 router = APIRouter(
@@ -161,6 +151,46 @@ def _get_owned_or_shared_or_404(
         )
 
     return doc
+
+
+def _get_owned_or_404(
+    db: Session,
+    doc_id: UUID,
+    current_user: User,
+) -> Document:
+    """
+    Return the document only if the current user owns it.
+
+    Ownership is required for document-management operations such as:
+    - uploading new versions
+    - signing versions
+    - renaming
+    - archiving
+    - creating/revoking shares
+    """
+    doc = (
+        db.query(Document)
+        .filter(
+            Document.id == doc_id,
+            Document.organization_id == current_user.organization_id,
+        )
+        .first()
+    )
+
+    if not doc:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    if doc.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the document owner can perform this action",
+        )
+
+    return doc
+
 
 def _get_latest_version(
     db: Session,
@@ -467,12 +497,31 @@ def list_documents(
             ),
         )
 
+    now = datetime.now(timezone.utc)
+
+    active_share_exists = (
+        db.query(DocumentShare.id)
+        .filter(
+            DocumentShare.document_id == Document.id,
+            DocumentShare.shared_with_user_id == current_user.id,
+            DocumentShare.revoked_at.is_(None),
+            (
+                DocumentShare.expires_at.is_(None)
+                | (DocumentShare.expires_at > now)
+            ),
+        )
+        .exists()
+    )
+
     query = (
         db.query(Document)
         .filter(
-            Document.organization_id
-            == current_user.organization_id,
+            Document.organization_id == current_user.organization_id,
             Document.is_archived.is_(False),
+            or_(
+                Document.owner_id == current_user.id,
+                active_share_exists,
+            ),
         )
     )
 
@@ -532,7 +581,7 @@ def get_document(
     current_user: User = Depends(get_current_user),
 ):
 
-    doc = _get_owned_or_404(
+    doc = _get_owned_or_shared_or_404(
         db,
         doc_id,
         current_user,
@@ -569,7 +618,7 @@ def download_document(
     current_user: User = Depends(get_current_user),
 ):
 
-    doc = _get_owned_or_404(
+    doc = _get_owned_or_shared_or_404(
         db,
         doc_id,
         current_user,
@@ -641,7 +690,7 @@ def download_document(
             )
 
     return StreamingResponse(
-        io.BytesIO(plaintext),
+        BytesIO(plaintext),
         media_type=(
             doc.mime_type
             or "application/octet-stream"
@@ -673,7 +722,7 @@ def verify_integrity(
     current_user: User = Depends(get_current_user),
 ):
 
-    doc = _get_owned_or_404(
+    doc = _get_owned_or_shared_or_404(
         db,
         doc_id,
         current_user,
@@ -964,7 +1013,7 @@ def version_history(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
-    doc = _get_owned_or_404(
+    doc = _get_owned_or_shared_or_404(
         db,
         doc_id,
         current_user,
@@ -1016,7 +1065,7 @@ def download_version(
     # Verify document belongs to current user's organization
     # --------------------------------------------------------
 
-    doc = _get_owned_or_404(
+    doc = _get_owned_or_shared_or_404(
         db,
         doc_id,
         current_user,
@@ -1117,7 +1166,7 @@ def download_version(
     # --------------------------------------------------------
 
     return StreamingResponse(
-        io.BytesIO(plaintext),
+        BytesIO(plaintext),
         media_type=(
             doc.mime_type
             or "application/octet-stream"
@@ -1306,7 +1355,7 @@ def verify_signature_status(
     current_user: User = Depends(get_current_user),
 ):
 
-    doc = _get_owned_or_404(
+    doc = _get_owned_or_shared_or_404(
         db,
         doc_id,
         current_user,
@@ -1625,24 +1674,9 @@ def create_share(
         # allow a new share to be created.
         if (
             existing_share.expires_at is not None
-            and existing_share.expires_at
-            <= __import__(
-                "datetime"
-            ).datetime.now(
-                __import__(
-                    "datetime"
-                ).timezone.utc
-            )
+            and existing_share.expires_at <= datetime.now(timezone.utc)
         ):
-            existing_share.revoked_at = (
-                __import__(
-                    "datetime"
-                ).datetime.now(
-                    __import__(
-                        "datetime"
-                    ).timezone.utc
-                )
-            )
+            existing_share.revoked_at = datetime.now(timezone.utc)
 
             db.flush()
 
@@ -1660,8 +1694,6 @@ def create_share(
     # --------------------------------------------------------
 
     if payload.expires_at is not None:
-
-        from datetime import datetime, timezone
 
         expires_at = payload.expires_at
 
@@ -1686,7 +1718,11 @@ def create_share(
         document_id=doc.id,
         shared_with_user_id=shared_with_user.id,
         permission_level=payload.permission_level,
-        expires_at=payload.expires_at,
+        expires_at=(
+            expires_at
+            if payload.expires_at is not None
+            else None
+        ),
         revoked_at=None,
     )
 
@@ -1775,6 +1811,12 @@ def revoke_share(
         raise HTTPException(
             status_code=404,
             detail="Document not found",
+        )
+
+    if document.owner_id != current_user.id:
+        raise HTTPException(
+            status_code=403,
+            detail="Only the document owner can revoke shares",
         )
 
     # --------------------------------------------------------

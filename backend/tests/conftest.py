@@ -7,6 +7,7 @@ from app.main import app
 from app.db.session import SessionLocal, get_db
 from app.models.user import User, Organization
 from app.models.rbac import Role, user_roles
+from app.models.share import DocumentShare
 from app.models.document import Document
 from app.core.security import hash_password
 from app.core.tokens import create_access_token
