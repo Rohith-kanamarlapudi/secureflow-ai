@@ -27,6 +27,10 @@ from app.models.document import (
 )
 
 from app.models.user import User
+from app.models.share import DocumentShare
+from app.schemas.share import ShareIn
+
+from app.models.user import User
 
 from app.storage.local import LocalStorage
 
@@ -1475,4 +1479,201 @@ def archive_document(
     return {
         "status": "archived",
         "id": str(doc.id),
+    }
+# ============================================================
+# Create document share
+# ============================================================
+
+@router.post(
+    "/{doc_id}/shares",
+    dependencies=[
+        Depends(
+            require_permission("document:share")
+        )
+    ],
+)
+def create_share(
+    doc_id: UUID,
+    payload: ShareIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Verify document belongs to current user's organization
+    # --------------------------------------------------------
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    # --------------------------------------------------------
+    # Verify target user exists
+    # and belongs to the same organization
+    # --------------------------------------------------------
+
+    shared_with_user = (
+        db.query(User)
+        .filter(
+            User.id == payload.user_id,
+            User.organization_id
+            == current_user.organization_id,
+            User.is_active.is_(True),
+        )
+        .first()
+    )
+
+    if not shared_with_user:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "User not found in the "
+                "current organization"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Validate permission level
+    # --------------------------------------------------------
+
+    if payload.permission_level not in {
+        "view",
+        "edit",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "permission_level must be "
+                "'view' or 'edit'"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Prevent sharing with yourself
+    # --------------------------------------------------------
+
+    if shared_with_user.id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot share a document with yourself",
+        )
+
+    # --------------------------------------------------------
+    # Check for an existing active share
+    # --------------------------------------------------------
+
+    existing_share = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.document_id
+            == doc.id,
+            DocumentShare.shared_with_user_id
+            == shared_with_user.id,
+            DocumentShare.revoked_at.is_(None),
+        )
+        .first()
+    )
+
+    if existing_share:
+
+        # If an existing share has expired,
+        # allow a new share to be created.
+        if (
+            existing_share.expires_at is not None
+            and existing_share.expires_at
+            <= __import__(
+                "datetime"
+            ).datetime.now(
+                __import__(
+                    "datetime"
+                ).timezone.utc
+            )
+        ):
+            existing_share.revoked_at = (
+                __import__(
+                    "datetime"
+                ).datetime.now(
+                    __import__(
+                        "datetime"
+                    ).timezone.utc
+                )
+            )
+
+            db.flush()
+
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "An active share already exists "
+                    "for this user"
+                ),
+            )
+
+    # --------------------------------------------------------
+    # Validate expiry
+    # --------------------------------------------------------
+
+    if payload.expires_at is not None:
+
+        from datetime import datetime, timezone
+
+        expires_at = payload.expires_at
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(
+                tzinfo=timezone.utc
+            )
+
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "expires_at must be in the future"
+                ),
+            )
+
+    # --------------------------------------------------------
+    # Create share
+    # --------------------------------------------------------
+
+    share = DocumentShare(
+        document_id=doc.id,
+        shared_with_user_id=shared_with_user.id,
+        permission_level=payload.permission_level,
+        expires_at=payload.expires_at,
+        revoked_at=None,
+    )
+
+    try:
+
+        db.add(share)
+        db.commit()
+        db.refresh(share)
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to create document share: "
+                f"{exc}"
+            ),
+        )
+
+    return {
+        "status": "created",
+        "id": str(share.id),
+        "document_id": str(share.document_id),
+        "shared_with_user_id": str(
+            share.shared_with_user_id
+        ),
+        "permission_level": (
+            share.permission_level
+        ),
+        "expires_at": share.expires_at,
+        "revoked_at": share.revoked_at,
     }
