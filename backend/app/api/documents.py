@@ -1029,6 +1029,201 @@ def verify_signature_status(
 
 
 # ============================================================
+# Upload new document version
+# ============================================================
+
+@router.post(
+    "/{doc_id}/versions",
+    dependencies=[
+        Depends(
+            require_permission("document:update")
+        )
+    ],
+)
+async def upload_new_version(
+    doc_id: UUID,
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Verify document ownership / organization
+    # --------------------------------------------------------
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    # --------------------------------------------------------
+    # Validate file type and size
+    # --------------------------------------------------------
+
+    if file.content_type not in ALLOWED_MIME:
+        raise HTTPException(
+            status_code=415,
+            detail=(
+                f"Unsupported file type: "
+                f"{file.content_type}"
+            ),
+        )
+
+    data = await file.read()
+
+    if len(data) == 0:
+        raise HTTPException(
+            status_code=400,
+            detail="Uploaded file is empty.",
+        )
+
+    if len(data) > MAX_SIZE:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                "File too large. "
+                "Maximum size is 50 MB."
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Get latest version and calculate next version number
+    # --------------------------------------------------------
+
+    latest = _get_latest_version(
+        db,
+        doc.id,
+    )
+
+    try:
+        next_version_number = str(
+            int(latest.version_number) + 1
+        )
+    except (ValueError, TypeError):
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid existing version number",
+        )
+
+    # --------------------------------------------------------
+    # SHA-256
+    # --------------------------------------------------------
+
+    sha256_hash = sha256_hex(data)
+
+    # --------------------------------------------------------
+    # Storage key
+    # --------------------------------------------------------
+
+    storage_key = (
+        f"{current_user.organization_id}/"
+        f"{doc.id}/"
+        f"v{next_version_number}"
+    )
+
+    # --------------------------------------------------------
+    # Encrypt
+    # --------------------------------------------------------
+
+    try:
+        blob = encrypt_file(
+            plaintext=data,
+            master_key=get_master_key(),
+            key_version="v1",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Encryption failed: {exc}",
+        )
+
+    # --------------------------------------------------------
+    # Store encrypted bytes
+    # AES-GCM authentication tag is stored after ciphertext.
+    # Nonce and wrapped key are stored as DB metadata.
+    # --------------------------------------------------------
+
+    encrypted_data = (
+        blob.ciphertext
+        + blob.tag
+    )
+
+    try:
+        storage.put(
+            storage_key,
+            encrypted_data,
+            file.content_type
+            or "application/octet-stream",
+        )
+    except Exception as exc:
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to store encrypted "
+                f"document version: {exc}"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Save version metadata and encryption metadata
+    # --------------------------------------------------------
+
+    try:
+        version = DocumentVersion(
+            document_id=doc.id,
+            version_number=next_version_number,
+            storage_key=storage_key,
+            nonce=blob.nonce,
+            sha256_hash=sha256_hash,
+        )
+
+        db.add(version)
+        db.flush()
+
+        encryption_key = EncryptionKey(
+            document_version_id=version.id,
+            wrapped_key=blob.wrapped_key,
+            key_version=blob.key_version,
+        )
+
+        db.add(encryption_key)
+
+        db.commit()
+        db.refresh(version)
+
+    except Exception as exc:
+        db.rollback()
+
+        # DB failed, so remove the orphaned storage object.
+        try:
+            storage.delete(storage_key)
+        except Exception:
+            pass
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to save version metadata: "
+                f"{exc}"
+            ),
+        )
+
+    return {
+        "status": "created",
+        "document_id": str(doc.id),
+        "version_id": str(version.id),
+        "version": next_version_number,
+        "filename": doc.filename,
+        "size": len(data),
+        "sha256_hash": sha256_hash,
+        "storage_key": storage_key,
+        "encrypted": True,
+        "key_version": blob.key_version,
+    }
+
+
+
+# ============================================================
 # Rename document
 # ============================================================
 
