@@ -27,6 +27,7 @@ from app.models.document import (
 )
 
 from app.models.user import User
+from app.models.document import Document, DocumentVersion
 from app.models.share import DocumentShare
 from app.schemas.share import ShareIn
 
@@ -1498,6 +1499,8 @@ def create_share(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
 ):
+    
+
     # --------------------------------------------------------
     # Verify document belongs to current user's organization
     # --------------------------------------------------------
@@ -1677,3 +1680,161 @@ def create_share(
         "expires_at": share.expires_at,
         "revoked_at": share.revoked_at,
     }
+# ============================================================
+# Revoke document share
+# ============================================================
+
+@router.delete(
+    "/shares/{share_id}",
+    dependencies=[
+        Depends(
+            require_permission("document:share")
+        )
+    ],
+)
+def revoke_share(
+    share_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Find the share
+    # --------------------------------------------------------
+
+    share = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.id == share_id,
+        )
+        .first()
+    )
+
+    if not share:
+        raise HTTPException(
+            status_code=404,
+            detail="Share not found",
+        )
+
+    # --------------------------------------------------------
+    # Verify the shared document belongs to the
+    # current user's organization
+    # --------------------------------------------------------
+
+    document = (
+        db.query(Document)
+        .filter(
+            Document.id == share.document_id,
+            Document.organization_id
+            == current_user.organization_id,
+        )
+        .first()
+    )
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    # --------------------------------------------------------
+    # Prevent revoking an already revoked share
+    # --------------------------------------------------------
+
+    if share.revoked_at is not None:
+        return {
+            "status": "already_revoked",
+            "share_id": str(share.id),
+            "revoked_at": share.revoked_at,
+        }
+
+    # --------------------------------------------------------
+    # Revoke
+    # --------------------------------------------------------
+
+    share.revoked_at = datetime.now(timezone.utc)
+
+    try:
+        db.commit()
+        db.refresh(share)
+
+    except Exception as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to revoke document share: {exc}",
+        )
+
+    return {
+        "status": "revoked",
+        "share_id": str(share.id),
+        "document_id": str(share.document_id),
+        "shared_with_user_id": str(
+            share.shared_with_user_id
+        ),
+        "revoked_at": share.revoked_at,
+    }
+
+
+# ============================================================
+# Active shares for a document
+# ============================================================
+
+@router.get(
+    "/{doc_id}/shares",
+    dependencies=[
+        Depends(
+            require_permission("document:read")
+        )
+    ],
+)
+def active_shares(
+    doc_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Verify document belongs to current user's organization
+    # --------------------------------------------------------
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    # --------------------------------------------------------
+    # Only return shares that are:
+    #   1. not revoked
+    #   2. not expired
+    # --------------------------------------------------------
+
+    now = datetime.now(timezone.utc)
+
+    shares = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.document_id == doc.id,
+            DocumentShare.revoked_at.is_(None),
+            (
+                DocumentShare.expires_at.is_(None)
+                | (DocumentShare.expires_at > now)
+            ),
+        )
+        .all()
+    )
+
+    return [
+        {
+            "id": str(share.id),
+            "document_id": str(share.document_id),
+            "shared_with_user_id": str(
+                share.shared_with_user_id
+            ),
+            "permission_level": share.permission_level,
+            "expires_at": share.expires_at,
+            "revoked_at": share.revoked_at,
+            "active": True,
+        }
+        for share in shares
+    ]
