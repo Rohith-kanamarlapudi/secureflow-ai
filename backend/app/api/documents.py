@@ -96,11 +96,19 @@ class DocumentUpdateIn(BaseModel):
 # Helpers
 # ============================================================
 
-def _get_owned_or_404(
+def _get_owned_or_shared_or_404(
     db: Session,
     doc_id: UUID,
     current_user: User,
 ) -> Document:
+    """
+    Return the document if the current user is either:
+
+    1. The document owner, or
+    2. An active recipient of a share.
+
+    Access is also restricted to the user's organization.
+    """
 
     doc = (
         db.query(Document)
@@ -118,8 +126,41 @@ def _get_owned_or_404(
             detail="Document not found",
         )
 
-    return doc
+    # --------------------------------------------------------
+    # Owner always has access
+    # --------------------------------------------------------
 
+    if doc.owner_id == current_user.id:
+        return doc
+
+    # --------------------------------------------------------
+    # Check active share
+    # --------------------------------------------------------
+
+    now = datetime.now(timezone.utc)
+
+    valid_share = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.document_id == doc_id,
+            DocumentShare.shared_with_user_id
+            == current_user.id,
+            DocumentShare.revoked_at.is_(None),
+            (
+                DocumentShare.expires_at.is_(None)
+                | (DocumentShare.expires_at > now)
+            ),
+        )
+        .first()
+    )
+
+    if not valid_share:
+        raise HTTPException(
+            status_code=403,
+            detail="No access to this document",
+        )
+
+    return doc
 
 def _get_latest_version(
     db: Session,
