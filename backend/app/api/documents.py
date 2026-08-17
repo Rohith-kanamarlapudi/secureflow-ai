@@ -27,6 +27,11 @@ from app.models.document import (
 )
 
 from app.models.user import User
+from app.models.document import Document, DocumentVersion
+from app.models.share import DocumentShare
+from app.schemas.share import ShareIn
+
+from app.models.user import User
 
 from app.storage.local import LocalStorage
 
@@ -91,11 +96,19 @@ class DocumentUpdateIn(BaseModel):
 # Helpers
 # ============================================================
 
-def _get_owned_or_404(
+def _get_owned_or_shared_or_404(
     db: Session,
     doc_id: UUID,
     current_user: User,
 ) -> Document:
+    """
+    Return the document if the current user is either:
+
+    1. The document owner, or
+    2. An active recipient of a share.
+
+    Access is also restricted to the user's organization.
+    """
 
     doc = (
         db.query(Document)
@@ -113,8 +126,41 @@ def _get_owned_or_404(
             detail="Document not found",
         )
 
-    return doc
+    # --------------------------------------------------------
+    # Owner always has access
+    # --------------------------------------------------------
 
+    if doc.owner_id == current_user.id:
+        return doc
+
+    # --------------------------------------------------------
+    # Check active share
+    # --------------------------------------------------------
+
+    now = datetime.now(timezone.utc)
+
+    valid_share = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.document_id == doc_id,
+            DocumentShare.shared_with_user_id
+            == current_user.id,
+            DocumentShare.revoked_at.is_(None),
+            (
+                DocumentShare.expires_at.is_(None)
+                | (DocumentShare.expires_at > now)
+            ),
+        )
+        .first()
+    )
+
+    if not valid_share:
+        raise HTTPException(
+            status_code=403,
+            detail="No access to this document",
+        )
+
+    return doc
 
 def _get_latest_version(
     db: Session,
@@ -1476,3 +1522,360 @@ def archive_document(
         "status": "archived",
         "id": str(doc.id),
     }
+# ============================================================
+# Create document share
+# ============================================================
+
+@router.post(
+    "/{doc_id}/shares",
+    dependencies=[
+        Depends(
+            require_permission("document:share")
+        )
+    ],
+)
+def create_share(
+    doc_id: UUID,
+    payload: ShareIn,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    
+
+    # --------------------------------------------------------
+    # Verify document belongs to current user's organization
+    # --------------------------------------------------------
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    # --------------------------------------------------------
+    # Verify target user exists
+    # and belongs to the same organization
+    # --------------------------------------------------------
+
+    shared_with_user = (
+        db.query(User)
+        .filter(
+            User.id == payload.user_id,
+            User.organization_id
+            == current_user.organization_id,
+            User.is_active.is_(True),
+        )
+        .first()
+    )
+
+    if not shared_with_user:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                "User not found in the "
+                "current organization"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Validate permission level
+    # --------------------------------------------------------
+
+    if payload.permission_level not in {
+        "view",
+        "edit",
+    }:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "permission_level must be "
+                "'view' or 'edit'"
+            ),
+        )
+
+    # --------------------------------------------------------
+    # Prevent sharing with yourself
+    # --------------------------------------------------------
+
+    if shared_with_user.id == current_user.id:
+        raise HTTPException(
+            status_code=400,
+            detail="You cannot share a document with yourself",
+        )
+
+    # --------------------------------------------------------
+    # Check for an existing active share
+    # --------------------------------------------------------
+
+    existing_share = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.document_id
+            == doc.id,
+            DocumentShare.shared_with_user_id
+            == shared_with_user.id,
+            DocumentShare.revoked_at.is_(None),
+        )
+        .first()
+    )
+
+    if existing_share:
+
+        # If an existing share has expired,
+        # allow a new share to be created.
+        if (
+            existing_share.expires_at is not None
+            and existing_share.expires_at
+            <= __import__(
+                "datetime"
+            ).datetime.now(
+                __import__(
+                    "datetime"
+                ).timezone.utc
+            )
+        ):
+            existing_share.revoked_at = (
+                __import__(
+                    "datetime"
+                ).datetime.now(
+                    __import__(
+                        "datetime"
+                    ).timezone.utc
+                )
+            )
+
+            db.flush()
+
+        else:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    "An active share already exists "
+                    "for this user"
+                ),
+            )
+
+    # --------------------------------------------------------
+    # Validate expiry
+    # --------------------------------------------------------
+
+    if payload.expires_at is not None:
+
+        from datetime import datetime, timezone
+
+        expires_at = payload.expires_at
+
+        if expires_at.tzinfo is None:
+            expires_at = expires_at.replace(
+                tzinfo=timezone.utc
+            )
+
+        if expires_at <= datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "expires_at must be in the future"
+                ),
+            )
+
+    # --------------------------------------------------------
+    # Create share
+    # --------------------------------------------------------
+
+    share = DocumentShare(
+        document_id=doc.id,
+        shared_with_user_id=shared_with_user.id,
+        permission_level=payload.permission_level,
+        expires_at=payload.expires_at,
+        revoked_at=None,
+    )
+
+    try:
+
+        db.add(share)
+        db.commit()
+        db.refresh(share)
+
+    except Exception as exc:
+
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=(
+                f"Failed to create document share: "
+                f"{exc}"
+            ),
+        )
+
+    return {
+        "status": "created",
+        "id": str(share.id),
+        "document_id": str(share.document_id),
+        "shared_with_user_id": str(
+            share.shared_with_user_id
+        ),
+        "permission_level": (
+            share.permission_level
+        ),
+        "expires_at": share.expires_at,
+        "revoked_at": share.revoked_at,
+    }
+# ============================================================
+# Revoke document share
+# ============================================================
+
+@router.delete(
+    "/shares/{share_id}",
+    dependencies=[
+        Depends(
+            require_permission("document:share")
+        )
+    ],
+)
+def revoke_share(
+    share_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Find the share
+    # --------------------------------------------------------
+
+    share = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.id == share_id,
+        )
+        .first()
+    )
+
+    if not share:
+        raise HTTPException(
+            status_code=404,
+            detail="Share not found",
+        )
+
+    # --------------------------------------------------------
+    # Verify the shared document belongs to the
+    # current user's organization
+    # --------------------------------------------------------
+
+    document = (
+        db.query(Document)
+        .filter(
+            Document.id == share.document_id,
+            Document.organization_id
+            == current_user.organization_id,
+        )
+        .first()
+    )
+
+    if not document:
+        raise HTTPException(
+            status_code=404,
+            detail="Document not found",
+        )
+
+    # --------------------------------------------------------
+    # Prevent revoking an already revoked share
+    # --------------------------------------------------------
+
+    if share.revoked_at is not None:
+        return {
+            "status": "already_revoked",
+            "share_id": str(share.id),
+            "revoked_at": share.revoked_at,
+        }
+
+    # --------------------------------------------------------
+    # Revoke
+    # --------------------------------------------------------
+
+    share.revoked_at = datetime.now(timezone.utc)
+
+    try:
+        db.commit()
+        db.refresh(share)
+
+    except Exception as exc:
+        db.rollback()
+
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to revoke document share: {exc}",
+        )
+
+    return {
+        "status": "revoked",
+        "share_id": str(share.id),
+        "document_id": str(share.document_id),
+        "shared_with_user_id": str(
+            share.shared_with_user_id
+        ),
+        "revoked_at": share.revoked_at,
+    }
+
+
+# ============================================================
+# Active shares for a document
+# ============================================================
+
+@router.get(
+    "/{doc_id}/shares",
+    dependencies=[
+        Depends(
+            require_permission("document:read")
+        )
+    ],
+)
+def active_shares(
+    doc_id: UUID,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    # --------------------------------------------------------
+    # Verify document belongs to current user's organization
+    # --------------------------------------------------------
+
+    doc = _get_owned_or_404(
+        db,
+        doc_id,
+        current_user,
+    )
+
+    # --------------------------------------------------------
+    # Only return shares that are:
+    #   1. not revoked
+    #   2. not expired
+    # --------------------------------------------------------
+
+    now = datetime.now(timezone.utc)
+
+    shares = (
+        db.query(DocumentShare)
+        .filter(
+            DocumentShare.document_id == doc.id,
+            DocumentShare.revoked_at.is_(None),
+            (
+                DocumentShare.expires_at.is_(None)
+                | (DocumentShare.expires_at > now)
+            ),
+        )
+        .all()
+    )
+
+    return [
+        {
+            "id": str(share.id),
+            "document_id": str(share.document_id),
+            "shared_with_user_id": str(
+                share.shared_with_user_id
+            ),
+            "permission_level": share.permission_level,
+            "expires_at": share.expires_at,
+            "revoked_at": share.revoked_at,
+            "active": True,
+        }
+        for share in shares
+    ]
