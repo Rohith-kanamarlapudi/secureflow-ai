@@ -18,6 +18,8 @@ from app.models.document import (
     AuditLog,
 )
 
+from app.models.share import DocumentShare
+
 config = context.config
 config.set_main_option(
     "sqlalchemy.url",
